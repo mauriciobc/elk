@@ -17,6 +17,7 @@ import {
   impressionProxy,
   lift,
   logNorm,
+  MASTODON_WEIGHTS,
   MAX_FOLLOWERS_THRESHOLD,
   MAX_POST_AGE_MS,
   NEGATIVE_SCORES_OFFSET,
@@ -228,6 +229,40 @@ describe('x_WEIGHTS', () => {
   })
 })
 
+describe('mASTODON_WEIGHTS — what the ranker actually resolves', () => {
+  it('differs from X in exactly two heads, and keeps the rest', () => {
+    // The whole point of keeping both tables is that the delta is reviewable.
+    // Anything added here without an argument in the constant's doc comment is
+    // a product decision smuggled in as a calibration change.
+    const changed = ACTION_KEYS.filter(k => MASTODON_WEIGHTS[k] !== X_WEIGHTS[k])
+    expect(changed.sort()).toEqual(['quote', 'share'])
+    expect(MASTODON_WEIGHTS.quote).toBe(1.0)
+    expect(MASTODON_WEIGHTS.share).toBe(0.5)
+  })
+
+  it('leaves the negative side exactly as X calibrated it', () => {
+    for (const key of ['notInterested', 'muteAuthor', 'blockAuthor', 'report', 'notDwelled'] as const)
+      expect(MASTODON_WEIGHTS[key]).toBe(X_WEIGHTS[key])
+    expect(weightSums(MASTODON_WEIGHTS).negativeSum).toBeCloseTo(367.22, 10)
+  })
+
+  it('drops the phantom quote surcharge on every boost prediction', () => {
+    // `quote` is derived as `retweet * 0.12`, so at X's weight of 5.0 it adds
+    // 0.12 * 5.0 = 0.60 per unit of P(boost) against the real boost head's
+    // 1.0 — a 60% surcharge for an action most fediverse software cannot
+    // perform. At 1.0 the surcharge is 12%.
+    const QUOTE_GIVEN_RETWEET = 0.12
+    expect(QUOTE_GIVEN_RETWEET * X_WEIGHTS.quote / X_WEIGHTS.retweet).toBeCloseTo(0.6, 10)
+    expect(QUOTE_GIVEN_RETWEET * MASTODON_WEIGHTS.quote / MASTODON_WEIGHTS.retweet).toBeCloseTo(0.12, 10)
+  })
+
+  it('is what an unconfigured context scores with', () => {
+    const candidate = makeCandidate({ favourites: 40 })
+    expect(raw(candidate)).toBeCloseTo(raw(candidate, signals(), ctx({ weights: MASTODON_WEIGHTS })), 12)
+    expect(raw(candidate)).not.toBeCloseTo(raw(candidate, signals(), ctx({ weights: X_WEIGHTS })), 6)
+  })
+})
+
 describe('weightSums', () => {
   it('splits by sign the way ScoringWeights::from_params does', () => {
     const sums = weightSums(X_WEIGHTS)
@@ -335,7 +370,11 @@ describe('the follow graph is applied exactly once', () => {
     const at = (favourites: number) =>
       final(makeCandidate({ inNetwork: false, favourites, ageMs: 2 * HOUR }))
 
-    const ladder = [1_000, 10_000, 100_000, 1_000_000].map(at)
+    // The ladder is anchored on the measured fediverse range, not X's. The
+    // largest post in a 5,205-post sample across 15 instances totalled 1,343
+    // interactions; `engagementSaturation` sits at 10,000, ~7x above that, so
+    // this spans the whole plausible corpus and then some.
+    const ladder = [10, 100, 1_000, 5_000].map(at)
     for (let i = 1; i < ladder.length; i++)
       expect(ladder[i]!).toBeGreaterThan(ladder[i - 1]!)
 
@@ -344,9 +383,110 @@ describe('the follow graph is applied exactly once', () => {
     expect(ladder[0]!).toBeGreaterThan(dullFollowed)
     expect(ladder[3]! / dullFollowed).toBeGreaterThan(3)
   })
+
+  it('does saturate past the plausible corpus, and that is the accepted trade', () => {
+    // Above `engagementSaturation` the popularity term stops separating posts.
+    // This is deliberate — see the constant's comment — but it is a real
+    // limit, so it is asserted rather than left to be rediscovered. Nothing in
+    // the sample came within 7x of here, and velocity, affinity and recency
+    // still order two posts that tie on popularity.
+    const at = (favourites: number) =>
+      final(makeCandidate({ inNetwork: false, favourites, ageMs: 2 * HOUR }))
+    expect(at(100_000)).toBeCloseTo(at(1_000_000), 12)
+  })
 })
 
 // ─────────────────────────────────────────────────────────── weighted sum ──
+
+describe('the bidirectional-follow reply boost is dormant, and loud when it wakes', () => {
+  it('does nothing unless the caller supplies mutualAuthorIds', () => {
+    // Nothing in `app/` populates `ctx.mutualAuthorIds` — `buildRankingContext`
+    // in feed.ts does not set it, and `ForYouFeedOptions.ranking` is typed
+    // `Pick<RankingContext, 'weights' | 'params'>`, so it cannot be passed in
+    // either. The 15.0 boost is inert in production today.
+    const candidate = makeCandidate({ authorId: 'mutual' })
+    expect(effectiveWeights(candidate, ctx()).reply).toBe(MASTODON_WEIGHTS.reply)
+  })
+
+  it('adds the full X boost to reply, and is sweepable', () => {
+    // Worth knowing before touching this: measured on two *real* captured
+    // pools (see CALIBRATION.md), turning the boost off moves 1 of 20 posts
+    // for one viewer and 0 of 20 for the other. It is nearly inert even when
+    // woken, because the head of a real ranking is dominated by high-engagement
+    // trending posts while mutuals' posts sit in a median-zero mass.
+    //
+    // A synthetic pool suggested it hands mutuals 60% of the top 20. That was
+    // an artifact of giving every candidate source the same engagement
+    // distribution. Don't re-derive this from a synthetic pool:
+    //   node scripts/for-you-capture.ts --viewer user@instance --out pool.json
+    //   pnpm for-you:replay --pool pool.json --set bidirectionalFollowReplyWeightBoost=0
+    const mutuals = new Set(['mutual'])
+    const candidate = makeCandidate({ authorId: 'mutual' })
+
+    expect(effectiveWeights(candidate, ctx({ mutualAuthorIds: mutuals })).reply)
+      .toBeCloseTo(MASTODON_WEIGHTS.reply + 15, 10)
+
+    // …and it is sweepable, so the harness can answer the question rather than
+    // anyone arguing about it.
+    expect(effectiveWeights(candidate, ctx({
+      mutualAuthorIds: mutuals,
+      params: { bidirectionalFollowReplyWeightBoost: 0 },
+    })).reply).toBeCloseTo(MASTODON_WEIGHTS.reply, 10)
+  })
+})
+
+describe('measured content priors', () => {
+  const p = (o: Parameters<typeof makeCandidate>[0]) => predictActions(makeCandidate(o), signals(), ctx())
+
+  it('discounts bot authors on the positive heads', () => {
+    // Measured 0.16-0.43x engagement, reproducing within-instance in 6 of 7.
+    const human = p({ bot: false })
+    const bot = p({ bot: true })
+    for (const key of ['favorite', 'reply', 'retweet'] as const)
+      expect(bot[key], key).toBeLessThan(human[key])
+  })
+
+  it('does not let bot-ness also inflate the negative heads', () => {
+    // One signal, one place. Counting bot-ness on both sides at once pushed an
+    // ordinary never-dismissed bot post below NEGATIVE_SCORES_OFFSET, into the
+    // band that is supposed to mean the viewer rejected it.
+    const human = p({ bot: false })
+    const bot = p({ bot: true })
+    expect(bot.notInterested).toBeCloseTo(human.notInterested, 12)
+    expect(bot.muteAuthor).toBeCloseTo(human.muteAuthor, 12)
+  })
+
+  it('keeps a zero-engagement bot post out of the rejection band', () => {
+    const botPost = raw(makeCandidate({ bot: true, favourites: 0, inNetwork: false }))
+    expect(botPost).toBeGreaterThan(NEGATIVE_SCORES_OFFSET)
+  })
+
+  it('discounts link posts instead of boosting them', () => {
+    // X lifts the share head 1.6x for links. On Mastodon link posts measurably
+    // under-perform: 0.61-0.80x, reach-controlled, in 7 of 8 instances.
+    expect(p({ card: true }).favorite).toBeLessThan(p({ card: false }).favorite)
+    expect(p({ card: true }).share).toBeLessThan(p({ card: false }).share)
+  })
+
+  it('rewards media and hashtags', () => {
+    expect(p({ tags: ['art'] }).favorite).toBeGreaterThan(p({ tags: [] }).favorite)
+  })
+
+  it('fades the priors out as observed engagement grows', () => {
+    // The priors are measurements of *crowd* engagement, so on a post whose
+    // counts are already visible they are the same effect twice — the count
+    // embodies them. They must matter most where the counts are silent, which
+    // on the fediverse is 59% of remote posts and 36% of local ones.
+    const gap = (favourites: number) =>
+      p({ bot: false, favourites }).favorite / p({ bot: true, favourites }).favorite
+
+    const silent = gap(0)
+    const popular = gap(5_000)
+    expect(silent).toBeGreaterThan(1)
+    expect(popular).toBeLessThan(silent)
+    expect(popular).toBeCloseTo(1, 1)
+  })
+})
 
 describe('scoreCandidate — the weighted sum', () => {
   it('is exactly the sum of one head when the other weights are zeroed', () => {
@@ -495,32 +635,73 @@ describe('logNorm — heavy-tail normalization', () => {
 describe('engagement keeps discriminating across the whole corpus', () => {
   const at = (favourites: number) => raw(makeCandidate({ favourites, ageMs: 2 * HOUR }))
 
-  it('still separates 300 from 3,000 from 300,000', () => {
+  it('still separates 30 from 300 from 3,000', () => {
     // The failure this guards: a saturation point in the middle of the corpus
     // clipped everything interesting to 1.0, so on a busy instance engagement
     // dropped out of the ordering completely and the feed degenerated into
     // reverse-chron with a follow-graph tiebreak.
+    //
+    // The rungs are the measured corpus, not X's. Median local post: 1
+    // interaction. p99: 68. Median trending post: 37. Largest post seen
+    // anywhere in 5,205 posts across 15 instances: 1,343.
+    expect(at(300)).toBeGreaterThan(at(30) * 1.1)
     expect(at(3_000)).toBeGreaterThan(at(300) * 1.1)
-    expect(at(300_000)).toBeGreaterThan(at(3_000) * 1.1)
   })
 
-  it('is strictly increasing over five orders of magnitude', () => {
-    const ladder = [0, 3, 30, 300, 3_000, 30_000, 300_000].map(at)
+  it('is strictly increasing across the whole plausible corpus', () => {
+    const ladder = [0, 1, 3, 10, 37, 68, 300, 769, 1_343, 5_000].map(at)
     for (let i = 1; i < ladder.length; i++)
       expect(ladder[i]!, `step ${i}`).toBeGreaterThan(ladder[i - 1]!)
   })
 
   it('still has strongly diminishing returns', () => {
-    expect(at(30) - at(0)).toBeGreaterThan(at(300_000) - at(30_000))
+    expect(at(10) - at(0)).toBeGreaterThan(at(5_000) - at(1_343))
   })
 
-  it('treats local and remote counts identically', () => {
-    // A previous revision multiplied remote counts by a constant to "correct"
-    // federation under-counting. Wrong functional form — see the comment in
-    // extractRankingFeatures.
+  it('puts a remote post on the same scale as a local one', () => {
+    // Federation under-counts, and it does so unevenly: measured by fetching
+    // the same post from its home instance and from an observing one (n=186),
+    // favourites arrive at 0.60 of their true value, boosts at 0.93, replies
+    // at 1.00. So a remote post showing 18 favourites and a local post showing
+    // 30 represent the same underlying popularity, and must score the same.
     const local = raw(makeCandidate({ acct: 'alice', favourites: 30 }))
-    const remote = raw(makeCandidate({ acct: 'alice@remote.example', favourites: 30 }))
+    const remote = raw(makeCandidate({ acct: 'alice@remote.example', favourites: 18 }))
     expect(remote).toBeCloseTo(local, 12)
+  })
+
+  it('corrects each count by how much of it federates, not by one constant', () => {
+    // The measured asymmetry: favourites reach an observing instance at 0.60
+    // coverage, boosts at 0.93, replies at 1.00. So 20 observed favourites on
+    // a remote post imply more true engagement than 20 observed boosts do.
+    // Asserted on the composite itself — the heads above it add density lifts
+    // that would otherwise mask which effect is being measured.
+    const estimate = (o: Parameters<typeof makeCandidate>[0]) =>
+      extractRankingFeatures(makeCandidate(o), signals(), ctx()).engagementEstimate
+
+    expect(estimate({ acct: 'a@remote.example', favourites: 20 })).toBeCloseTo(20 / 0.6, 10)
+    expect(estimate({ acct: 'a@remote.example', reblogs: 20 })).toBeCloseTo(20 / 0.93, 10)
+    expect(estimate({ acct: 'a@remote.example', replies: 20 })).toBeCloseTo(20, 10)
+
+    // A local post is authoritative and is left exactly alone.
+    expect(estimate({ acct: 'a', favourites: 20 })).toBeCloseTo(20, 10)
+
+    // And the raw observed sum stays honest either way — `impressionProxy`
+    // and the density ratios below depend on it being what was reported.
+    expect(extractRankingFeatures(
+      makeCandidate({ acct: 'a@remote.example', favourites: 20 }),
+      signals(),
+      ctx(),
+    ).totalEngagement).toBe(20)
+  })
+
+  it('does not pretend to recover engagement that never federated', () => {
+    // The correction is to the scale, not to the post. Dividing zero by 0.6 is
+    // still zero — and 10% of remote posts report zero favourites when the
+    // home instance has some. A remote post with nothing visible must not be
+    // inflated into looking popular.
+    const remoteSilent = raw(makeCandidate({ acct: 'bob@remote.example', favourites: 0 }))
+    const localSilent = raw(makeCandidate({ acct: 'bob', favourites: 0 }))
+    expect(remoteSilent).toBeCloseTo(localSilent, 12)
   })
 })
 
