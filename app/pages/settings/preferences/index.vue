@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import type { HomeTab } from '~/composables/settings'
+
 const { t } = useI18n()
 
 useHydratedHead({
@@ -6,6 +8,18 @@ useHydratedHead({
 })
 
 const userSettings = useUserSettings()
+
+const forYouEnabled = usePreferences('enableForYouFeed')
+const defaultHomeTab = computed<HomeTab>(() => userSettings.value.defaultHomeTab ?? 'following')
+
+const homeTabs = [
+  { value: 'for-you', label: 'tab.for_you', icon: 'i-ri:sparkling-line' },
+  { value: 'following', label: 'tab.following', icon: 'i-ri:user-follow-line' },
+] as const
+
+function setDefaultHomeTab(tab: HomeTab) {
+  userSettings.value.defaultHomeTab = tab
+}
 </script>
 
 <template>
@@ -84,6 +98,41 @@ const userSettings = useUserSettings()
       >
         {{ $t('settings.preferences.use_star_favorite_icon') }}
       </SettingsToggleItem>
+    </section>
+    <section>
+      <h2 px6 py4 mt2 font-bold text-xl flex="~ gap-1" items-center>
+        <span aria-hidden="true" block i-ri-home-5-line />
+        {{ $t('settings.preferences.home_feed') }}
+      </h2>
+      <SettingsToggleItem
+        :checked="getPreferences(userSettings, 'enableForYouFeed')"
+        @click="togglePreferences('enableForYouFeed')"
+      >
+        {{ $t('settings.preferences.enable_for_you') }}
+        <template #description>
+          {{ $t('settings.preferences.enable_for_you_description') }}
+        </template>
+      </SettingsToggleItem>
+      <div px5 py3 space-y-2 :class="forYouEnabled ? '' : 'op50'">
+        <h3 id="settings-default-home-tab" font-medium>
+          {{ $t('settings.preferences.default_home_tab') }}
+        </h3>
+        <div flex="~ gap4 wrap" w-full role="group" aria-labelledby="settings-default-home-tab">
+          <button
+            v-for="tab in homeTabs"
+            :key="tab.value"
+            type="button"
+            btn-text flex-1 flex="~ gap-1 center" p4 border="~ base rounded" bg-base ws-nowrap
+            :disabled="!forYouEnabled"
+            :aria-pressed="defaultHomeTab === tab.value ? 'true' : 'false'"
+            :class="defaultHomeTab === tab.value ? 'pointer-events-none' : 'filter-saturate-0'"
+            @click="setDefaultHomeTab(tab.value)"
+          >
+            <span aria-hidden="true" :class="tab.icon" />
+            {{ $t(tab.label) }}
+          </button>
+        </div>
+      </div>
     </section>
     <section>
       <h2 px6 py4 mt2 font-bold text-xl flex="~ gap-1" items-center>

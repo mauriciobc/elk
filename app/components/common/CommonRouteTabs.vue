@@ -11,6 +11,7 @@ const { options, command, preventScrollTop = false } = defineProps<{
 
 const { t } = useI18n()
 const router = useRouter()
+const route = useRoute()
 
 useCommands(() => command
   ? options.map(tab => ({
@@ -20,27 +21,105 @@ useCommands(() => command
       onActivate: () => router.replace(tab.to),
     }))
   : [])
+
+/**
+ * A screen reader announces this row as a set of unrelated links, not a tab
+ * strip, because it never carried tab semantics — no `role="tablist"`/`tab`,
+ * no `aria-selected`, no roving tabindex. Fixed centrally rather than per
+ * page: every caller (`home`, `explore`, `notifications`, `AccountTabs`, the
+ * list page) renders the same structure, so five copies of the same ARIA
+ * wiring would be five chances for it to drift out of sync. Visual styling
+ * (the active tab's underline) still comes entirely from `exact-active-class`
+ * and is untouched; this only adds the semantics layered on top of it.
+ */
+const visibleOptions = computed(() => options.filter(item => !item.hide))
+const focusableOptions = computed(() => visibleOptions.value.filter(item => !item.disabled))
+
+/**
+ * `option.match` (used today for the "more" overflow entry) is honoured when
+ * a caller sets it explicitly; otherwise the active tab is whichever option's
+ * route resolves to the current path — an approximation of `exact-active`
+ * good enough for `aria-selected`, which never needs to be pixel-perfect.
+ */
+function isTabActive(option: CommonRouteTabOption): boolean {
+  if (option.match !== undefined)
+    return option.match
+  try {
+    return router.resolve(option.to).path === route.path
+  }
+  catch {
+    return false
+  }
+}
+
+const activeFocusableIndex = computed(() => {
+  const index = focusableOptions.value.findIndex(isTabActive)
+  return index === -1 ? 0 : index
+})
+
+const tabRefs = ref<HTMLElement[]>([])
+function setTabRef(el: unknown, index: number) {
+  const node = (el as { $el?: HTMLElement })?.$el ?? (el as HTMLElement | null)
+  if (node instanceof HTMLElement)
+    tabRefs.value[index] = node
+  else
+    delete tabRefs.value[index]
+}
+
+/** Roving tabindex + arrow-key movement, per the WAI-ARIA tabs pattern. */
+function onTabKeydown(event: KeyboardEvent, index: number) {
+  const total = focusableOptions.value.length
+  if (!total)
+    return
+
+  let next: number | undefined
+  switch (event.key) {
+    case 'ArrowRight':
+    case 'ArrowDown':
+      next = (index + 1) % total
+      break
+    case 'ArrowLeft':
+    case 'ArrowUp':
+      next = (index - 1 + total) % total
+      break
+    case 'Home':
+      next = 0
+      break
+    case 'End':
+      next = total - 1
+      break
+    default:
+      return
+  }
+
+  event.preventDefault()
+  tabRefs.value[next]?.focus()
+}
 </script>
 
 <template>
-  <div flex w-full items-center lg:text-lg of-x-auto scrollbar-hide border="b base">
+  <div flex w-full items-center lg:text-lg of-x-auto scrollbar-hide border="b base" role="tablist">
     <template
-      v-for="(option, index) in options.filter(item => !item.hide)"
+      v-for="(option, index) in visibleOptions"
       :key="option?.name || index"
     >
       <NuxtLink
         v-if="!option.disabled"
+        :ref="(el: unknown) => setTabRef(el, focusableOptions.indexOf(option))"
         :to="option.to"
         :replace="replace"
         relative flex flex-auto cursor-pointer sm:px6 px2 rounded transition-all
-        tabindex="0"
+        role="tab"
+        :aria-selected="isTabActive(option) ? 'true' : 'false'"
+        :tabindex="focusableOptions.indexOf(option) === activeFocusableIndex ? 0 : -1"
         hover:bg-active transition-100
         exact-active-class="children:(text-secondary !border-primary !op100 !text-base)"
         @click="!preventScrollTop && $scrollToTop()"
+        @keydown="onTabKeydown($event, focusableOptions.indexOf(option))"
       >
         <span ws-nowrap mxa sm:px2 sm:py3 xl:pb4 xl:pt5 py2 text-center border-b-3 text-secondary-light hover:text-secondary border-transparent>{{ option.display || '&nbsp;' }}</span>
       </NuxtLink>
-      <div v-else flex flex-auto sm:px6 px2 xl:pb4 xl:pt5>
+      <div v-else flex flex-auto sm:px6 px2 xl:pb4 xl:pt5 role="tab" aria-disabled="true" aria-selected="false" tabindex="-1">
         <span ws-nowrap mxa sm:px2 sm:py3 py2 text-center text-secondary-light op50>{{ option.display }}</span>
       </div>
     </template>

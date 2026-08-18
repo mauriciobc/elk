@@ -81,6 +81,7 @@ export default defineNuxtConfig({
   },
   imports: {
     dirs: [
+      './composables/for-you',
       './composables/masto',
       './composables/push-notifications',
       './composables/settings',

@@ -29,6 +29,14 @@ export function useRelationship(account: mastodon.v1.Account): Ref<mastodon.v1.R
   return relationship
 }
 
+/**
+ * The relationship we already know about, if any. Never fetches: callers on a
+ * hot path (recording a For You engagement) must not cost a round trip.
+ */
+export function getCachedRelationship(accountId: string): mastodon.v1.Relationship | undefined {
+  return requestedRelationships.get(accountId)?.value
+}
+
 async function fetchRelationships() {
   const requested = [...requestedRelationships.entries()].filter(([, r]) => !r.value)
   const relationships = await useMastoClient().v1.accounts.relationships.fetch({ id: requested.map(([id]) => id) })
@@ -68,6 +76,12 @@ export async function toggleFollowAccount(relationship: mastodon.v1.Relationship
     relationship!.following = true
   }
 
+  // `FollowAuthorWeight` — the strongest positive signal the For You feed gets.
+  if (unfollow)
+    forgetFollow(account.id)
+  else
+    recordFollow(account)
+
   relationship = await client.value.v1.accounts.$select(account.id)[unfollow ? 'unfollow' : 'follow']()
 }
 
@@ -93,6 +107,13 @@ export async function toggleMuteAccount(relationship: mastodon.v1.Relationship, 
   }
 
   relationship!.muting = !relationship!.muting
+  // `AuthorSocialgraphFilter`: a muted account must not come back through the
+  // For You feed's out-of-network sources.
+  if (relationship!.muting)
+    muteAuthorForYou(account.id)
+  else
+    unmuteAuthorForYou(account.id)
+
   relationship = relationship!.muting
     ? await client.value.v1.accounts.$select(account.id).mute({
         duration,
@@ -117,6 +138,11 @@ export async function toggleBlockAccount(relationship: mastodon.v1.Relationship,
   }
 
   relationship!.blocking = !relationship!.blocking
+  if (relationship!.blocking)
+    muteAuthorForYou(account.id)
+  else if (!relationship!.muting)
+    unmuteAuthorForYou(account.id)
+
   relationship = await client.value.v1.accounts.$select(account.id)[relationship!.blocking ? 'block' : 'unblock']()
 }
 

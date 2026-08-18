@@ -14,6 +14,14 @@ const emit = defineEmits<{
 
 const focusEditor = inject<typeof noop>('focus-editor', noop)
 
+/**
+ * Provided per post by `TimelineForYouItem`. Present only inside the For You
+ * feed, where "not interested" and "show less from this account" are the two
+ * levers the viewer has on the ranker; everywhere else this is undefined and
+ * the menu is exactly what it always was.
+ */
+const forYouItem = inject(forYouItemInjectionKey, undefined)
+
 const {
   status,
   isLoading,
@@ -189,6 +197,24 @@ function showReactedBy() {
             :command="command"
             :disabled="isLoading.bookmarked"
             @click="toggleBookmark()"
+          />
+        </template>
+
+        <template v-if="forYouItem">
+          <CommonDropdownItem
+            is="button"
+            :text="$t('menu.not_interested')"
+            icon="i-ri:thumb-down-line"
+            :command="command"
+            @click="forYouItem.notInterested()"
+          />
+
+          <CommonDropdownItem
+            is="button"
+            :text="$t('menu.show_less_from_account', [`@${status.account.acct}`])"
+            icon="i-ri:user-forbid-line"
+            :command="command"
+            @click="forYouItem.showLessFromAuthor()"
           />
         </template>
 

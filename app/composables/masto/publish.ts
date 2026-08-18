@@ -132,6 +132,12 @@ export function usePublish(options: {
           })),
         })
       }
+      // Replying to / quoting a post is the strongest engagement the composer
+      // can produce; it feeds the For You viewer model. Edits are not new
+      // engagements, and a scheduled post has not happened yet.
+      if (!draftItem.value.editingStatus && !('scheduled_at' in status))
+        recordComposedStatus(status)
+
       if (draftItem.value.params.inReplyToId && !options.isPartOfThread)
         navigateToStatus({ status })
 

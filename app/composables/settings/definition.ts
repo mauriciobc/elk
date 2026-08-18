@@ -7,6 +7,9 @@ export type OldFontSize = 'xs' | 'sm' | 'md' | 'lg' | 'xl'
 
 export type ColorMode = 'light' | 'dark' | 'system'
 
+/** The two tabs on `/home`. `following` is the chronological home timeline. */
+export type HomeTab = 'following' | 'for-you'
+
 export type NavButtonName = 'home' | 'search' | 'notification' | 'mention' | 'favorite' | 'bookmark' | 'compose' | 'scheduledPosts' | 'explore' | 'local' | 'federated' | 'list' | 'collection' | 'hashtag' | 'setting' | 'moreMenu'
 
 export interface PreferencesSettings {
@@ -25,6 +28,7 @@ export interface PreferencesSettings {
   hideRepliesInTimeline: boolean
   hideBoostsInTimeline: boolean
   disableTimelineAutoloading: boolean
+  enableForYouFeed: boolean
   grayscaleMode: boolean
   enableAutoplay: boolean
   unmuteVideos: boolean
@@ -46,6 +50,8 @@ export interface UserSettings {
   language: string
   disabledTranslationLanguages: string[]
   themeColors?: ThemeColors
+  /** Which tab `/home` opens on. Defaults to `following`. */
+  defaultHomeTab?: HomeTab
 }
 
 export interface ThemeColors {
@@ -86,6 +92,7 @@ export const DEFAULT__PREFERENCES_SETTINGS: PreferencesSettings = {
   hideRepliesInTimeline: false,
   hideBoostsInTimeline: false,
   disableTimelineAutoloading: false,
+  enableForYouFeed: true,
   grayscaleMode: false,
   enableAutoplay: false,
   unmuteVideos: false,

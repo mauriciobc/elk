@@ -92,6 +92,11 @@ export function navigateToStatus({ status, focusReply = false }: {
   status: mastodon.v1.Status
   focusReply?: boolean
 }) {
+  // `ClickWeight` — opening a post is the weakest positive engagement we can
+  // observe, and the one that happens most. It also means the post was seen.
+  recordEngagement(status, 'open')
+  markSeen([(status.reblog ?? status).id])
+
   return navigateTo({
     path: getStatusRoute(status).href,
     state: { focusReply },
