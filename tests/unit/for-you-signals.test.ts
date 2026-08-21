@@ -26,6 +26,7 @@ import {
   markSeenInSignals,
   MAX_DISMISSED,
   MAX_FOLLOW_SIGNALS,
+  MAX_IMPRESSED_AUTHORS,
   MAX_MUTED,
   MAX_SEEN,
   MAX_SIGNALS_PER_KIND,
@@ -1059,6 +1060,26 @@ describe('for-you signals: counters and the impression population (the populatio
     expect(signals.counters.actions.favourite).toBe(1)
   })
 
+  it('no entry point can move a counter for an unimpressed post — the gate is one place, so prove it once for all of them', () => {
+    // The population rule used to be re-asserted at each call site, where the
+    // sixth one could quietly forget it. It now lives in `bumpActionCounter`.
+    // This drives *every* entry point that reaches it, against a post that was
+    // never impressed, and asserts `actions` is still completely empty.
+    const signals = createEmptySignals()
+
+    recordSignal(signals, 'favourite', target({ statusId: 'ghost', authorId: 'a' }), NOW)
+    recordSignal(signals, 'reblog', target({ statusId: 'ghost', authorId: 'a' }), NOW)
+    forgetSignal(signals, 'favourite', 'ghost', NOW)
+    applyNotInterestedToSignals(signals, 'ghost', target({ statusId: 'ghost', authorId: 'a' }), NOW)
+    forgetNotInterestedToSignals(signals, 'ghost', NOW)
+    applyMuteToSignals(signals, 'a', NOW, 'ghost')
+    // The account-wide mute path, which has no post at all: also never counts.
+    applyMuteToSignals(signals, 'b', NOW)
+
+    expect(signals.counters.actions).toEqual({})
+    expect(signals.counters.impressions).toBe(0)
+  })
+
   it('forgetSignal decrements the matching counter, gated the same way the increment was', () => {
     const signals = createEmptySignals()
     recordForYouImpressionInSignals(signals, { id: 's1', hasLink: false, hasMedia: false, outOfNetwork: false })
@@ -1113,6 +1134,101 @@ describe('for-you signals: counters and the impression population (the populatio
     // own key, which is impressed.
     applyMuteToSignals(signals, 'account-b', NOW, 's1')
     expect(signals.counters.actions.mute).toBe(1)
+  })
+
+  // ── followAuthor: the one head attributed by author, not by post ──────────
+  //
+  // `recordFollow` mints a synthetic `follow:<accountId>` key that can never
+  // appear in `impressed`, so the post gate rejects every follow and pinned
+  // `actions.follow` at zero forever. The gate for this kind asks the only
+  // question a follow can answer: was this *author* put on screen, out of
+  // network, by For You.
+
+  it('counts a follow of an author seen out-of-network in For You', () => {
+    const signals = createEmptySignals()
+    recordForYouImpressionInSignals(signals, {
+      id: 's1',
+      hasLink: false,
+      hasMedia: false,
+      outOfNetwork: true,
+      authorId: 'stranger',
+    })
+    expect(signals.impressedAuthors).toEqual(['stranger'])
+
+    // Exactly what `recordFollow` builds.
+    recordSignal(signals, 'follow', target({ statusId: 'follow:stranger', authorId: 'stranger' }), NOW)
+    expect(signals.counters.actions.follow).toBe(1)
+    expect(signals.counters.eligible.outOfNetwork).toBe(1)
+  })
+
+  it('does not count a follow of an author never seen out-of-network here', () => {
+    const signals = createEmptySignals()
+    // Seen, but in-network: `followAuthor` is gated on `!inNetwork` in the
+    // ranker, so this impression was never eligible for the head.
+    recordForYouImpressionInSignals(signals, {
+      id: 's1',
+      hasLink: false,
+      hasMedia: false,
+      outOfNetwork: false,
+      authorId: 'friend',
+    })
+    expect(signals.impressedAuthors).toEqual([])
+
+    recordSignal(signals, 'follow', target({ statusId: 'follow:friend', authorId: 'friend' }), NOW)
+    expect(signals.counters.actions.follow).toBeUndefined()
+    // The signal and its affinity are recorded regardless, as for every kind.
+    expect(signals.engaged.follow!.length).toBe(1)
+  })
+
+  it('does not count a follow reached from anywhere else in the app', () => {
+    const signals = createEmptySignals()
+    // A profile page, a hover card, a search result: no For You impression of
+    // this author at all.
+    recordSignal(signals, 'follow', target({ statusId: 'follow:nobody', authorId: 'nobody' }), NOW)
+    expect(signals.counters.actions.follow).toBeUndefined()
+  })
+
+  it('decrements symmetrically on an un-follow, keyed by the synthetic id', () => {
+    const signals = createEmptySignals()
+    recordForYouImpressionInSignals(signals, {
+      id: 's1',
+      hasLink: false,
+      hasMedia: false,
+      outOfNetwork: true,
+      authorId: 'stranger',
+    })
+    recordSignal(signals, 'follow', target({ statusId: 'follow:stranger', authorId: 'stranger' }), NOW)
+    expect(signals.counters.actions.follow).toBe(1)
+
+    // `forgetFollow` passes only the synthetic id; the author it was recorded
+    // against has to be recovered from the signal being removed.
+    forgetSignal(signals, 'follow', 'follow:stranger', NOW)
+    expect(signals.counters.actions.follow).toBeUndefined()
+  })
+
+  it('keeps impressedAuthors as a recency list, capped and deduped', () => {
+    const signals = createEmptySignals()
+    const seeAuthor = (id: string, author: string) => recordForYouImpressionInSignals(signals, {
+      id,
+      hasLink: false,
+      hasMedia: false,
+      outOfNetwork: true,
+      authorId: author,
+    })
+
+    seeAuthor('p1', 'a')
+    seeAuthor('p2', 'b')
+    // A *different* post by an author already seen refreshes their position
+    // rather than adding a second entry.
+    seeAuthor('p3', 'a')
+    expect(signals.impressedAuthors).toEqual(['b', 'a'])
+    // Every impression still counts toward the denominator, deduped by post.
+    expect(signals.counters.eligible.outOfNetwork).toBe(3)
+
+    for (let i = 0; i < MAX_IMPRESSED_AUTHORS; i++)
+      seeAuthor(`fill-${i}`, `author-${i}`)
+    expect(signals.impressedAuthors.length).toBe(MAX_IMPRESSED_AUTHORS)
+    expect(signals.impressedAuthors.includes('b')).toBe(false)
   })
 
   it('impressed evicts oldest-first at MAX_SEEN, like seen — but impressions itself is a lifetime count, never evicted', () => {

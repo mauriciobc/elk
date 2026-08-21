@@ -24,6 +24,26 @@ function headReport(report: ReturnType<typeof measuredBaseRatesReport>, head: ke
   return row
 }
 
+// ──────────────────────────────────────────────────────  head coverage ──
+
+describe('head classification', () => {
+  // `HEAD_CLASS` is `Record<Head, …>`, so a head added to `ActionProbabilities`
+  // is a compile error there until classified. This is the runtime half of the
+  // same guarantee: that `HEADS` — and therefore every sum, the finiteness
+  // check and the debug report — is derived from that table rather than
+  // hand-copied, so it cannot silently omit a head. Order is asserted too,
+  // because the report is read by a human against `BASE_RATES`.
+  it('reports every head BASE_RATES declares, in BASE_RATES order', () => {
+    const report = measuredBaseRatesReport(counters({ impressions: 500 }))
+    expect(report.perHead.map(row => row.head)).toEqual(Object.keys(BASE_RATES))
+  })
+
+  it('reports every head on the cold path too', () => {
+    expect(measuredBaseRatesReport(undefined).perHead.map(row => row.head))
+      .toEqual(Object.keys(BASE_RATES))
+  })
+})
+
 // ─────────────────────────────────────────────────────────────  cold path ──
 
 describe('measuredBaseRates — cold path', () => {
@@ -104,90 +124,106 @@ describe('measuredBaseRatesReport — conditional heads use the eligible denomin
     expect(denominatorFor('favorite', c)).toBe(8000)
   })
 
-  it('does not shrink followAuthor at all — its numerator is structurally dead', () => {
-    // `recordFollow` stores a synthetic `follow:<accountId>` key that can
-    // never be in `impressed`, so the membership gate rejects every follow and
-    // `actions.follow` is zero forever rather than merely under-sampled.
-    // Shrinking `k = 0` over a growing `eligible.outOfNetwork` would decay the
-    // head toward zero without bound (7x too small at n=3000, 61x at n=30000),
-    // so the head is treated as unmeasurable instead. `INTERCEPT.md` §4 lists
-    // it as measurable; this is a deliberate departure, documented on
-    // `UNMEASURABLE_HEADS`.
+  it('divides followAuthor by out-of-network impressions, never by all of them', () => {
+    // `followAuthor` is gated on `!inNetwork` in `predictActions` — following
+    // someone you already follow is not an action that exists — so an
+    // in-network impression was never eligible for it. Dividing by raw
+    // `impressions` would deflate the head by the whole in-network share of
+    // the feed, which on a follow-heavy account is most of it. Here only 20 of
+    // 6000 impressions were out of network, so the two differ by 300x.
     const c = counters({
       impressions: 6000,
       eligible: { hasLink: 0, hasMedia: 0, outOfNetwork: 20 },
-      // Even if a follow somehow were counted, it must not become a rate.
       actions: { follow: 1 },
     })
     const report = measuredBaseRatesReport(c)
     const row = headReport(report, 'followAuthor')
-    expect(row.k).toBe(0)
-    expect(row.n).toBe(0)
+    expect(row.k).toBe(1)
+    expect(row.n).toBe(20)
+    expect(denominatorFor('followAuthor', c)).toBe(20)
   })
 
-  it('lets followAuthor move only by the §6 positive-side rescale', () => {
-    // Same treatment as `share`/`vqv`: it tracks its side, never its own k/n.
+  it('lets followAuthor shrink on a genuinely observed zero, which is the whole point of wiring it', () => {
+    // This is the case that used to be indistinguishable from the broken one.
+    // A viewer who scrolled past 3000 strangers and followed none of them
+    // really does follow less often than `B0` says, and the estimator is now
+    // allowed to say so — `s·B0/(n + s)`, ordinary shrinkage, no special case.
+    // What made the old behaviour wrong was not the decay, it was that `k`
+    // *could not* be non-zero: `recordFollow`'s synthetic key never matched
+    // `impressed`, so every viewer looked like this one.
+    const s = BASE_RATE_PRIOR_STRENGTH
     const c = counters({
       impressions: 3000,
       eligible: { hasLink: 300, hasMedia: 300, outOfNetwork: 3000 },
       actions: { favourite: 90, reblog: 54, open: 90, notDwelled: 660 },
     })
-    const report = measuredBaseRatesReport(c)
-    expect(report.applied).toBe(true)
-    const ratioToShare = headReport(report, 'followAuthor').measured / headReport(report, 'share').measured
-    const shippedRatio = BASE_RATES.followAuthor / BASE_RATES.share
-    expect(ratioToShare).toBeCloseTo(shippedRatio, 12)
+    const row = headReport(measuredBaseRatesReport(c), 'followAuthor')
+    expect(row.k).toBe(0)
+    expect(row.n).toBe(3000)
+    expect(row.measured).toBeCloseTo((s * BASE_RATES.followAuthor) / (3000 + s), 12)
+    expect(row.measured).toBeLessThan(BASE_RATES.followAuthor)
   })
 
-  it('does not decay any unwired head as impressions pile up', () => {
-    // The same structural-zero problem `followAuthor` has, for four more
-    // heads: nothing in `app/` records a link click, photo expand, video open
-    // or profile tap, so their counters are pinned at 0 while their
-    // denominators climb. Measured on a realistic profile before the fix:
-    // openLink/photoExpand/videoOpen 7x low at n=30000, profileClick 61x.
-    // `N/P` stays in band throughout, so the §6.3 guardrail never fires — the
-    // only thing standing between this and a silently deflated ranker is this
-    // classification.
-    const honest = (n: number) => {
-      const media = Math.round(n / 10)
-      return measuredBaseRatesReport(counters({
-        impressions: n,
-        eligible: { hasLink: media, hasMedia: media, outOfNetwork: n },
-        // Exactly the signals that have a writer in the app today.
-        actions: {
-          favourite: n * BASE_RATES.favorite,
-          reply: n * BASE_RATES.reply,
-          reblog: n * BASE_RATES.retweet,
-          quote: n * BASE_RATES.quote,
-          open: n * BASE_RATES.click,
-          dwell: n * BASE_RATES.dwell,
-          notDwelled: n * BASE_RATES.notDwelled,
-          dismiss: n * BASE_RATES.notInterested,
-          mute: n * BASE_RATES.muteAuthor,
-        },
-      }))
-    }
-
-    for (const n of [3000, 30_000]) {
-      const report = honest(n)
-      expect(report.applied).toBe(true)
-      for (const head of ['openLink', 'photoExpand', 'videoOpen', 'profileClick', 'followAuthor'] as const) {
-        const row = headReport(report, head)
-        // Never given a denominator, so never shrunk toward zero.
-        expect(row.k).toBe(0)
-        expect(row.n).toBe(0)
-        expect(row.measured).toBeCloseTo(BASE_RATES[head], 12)
-      }
-    }
+  it('reproduces B0 for a viewer who follows at exactly the shipped rate', () => {
+    // The other half of the same property: a real numerator over the right
+    // denominator lands back on `B0` rather than anywhere near zero.
+    const oon = 20_000
+    const c = counters({
+      impressions: oon * 2,
+      eligible: { hasLink: 0, hasMedia: 0, outOfNetwork: oon },
+      actions: { follow: oon * BASE_RATES.followAuthor },
+    })
+    const row = headReport(measuredBaseRatesReport(c), 'followAuthor')
+    expect(row.measured).toBeCloseTo(BASE_RATES.followAuthor, 12)
   })
 
-  it('does not decay followAuthor as out-of-network impressions pile up', () => {
-    // The regression this fix exists to prevent. Every measurable head is held
-    // at exactly its shipped rate, so shrinkage is a no-op and both side sums
-    // are unchanged — which pins the §6 rescale factors at 1 and leaves
-    // `followAuthor` sitting on `B0` no matter how large `n` gets. Under the
-    // old treatment (k=0 over a growing `eligible.outOfNetwork`) the same
-    // fixture drove it 7x low at n=3000 and 61x low at n=30000.
+  it('measures the click-family heads against their own eligible denominator, not raw impressions', () => {
+    // These four were `unwired` — nothing in `app/` recorded a link click,
+    // photo expand, video open or profile tap, so their counters were pinned
+    // at 0 while their denominators climbed (7x low at n=30000, 61x for
+    // `profileClick`). Their writers exist now (`StatusPreviewCard.vue`,
+    // `StatusAttachment.vue`, `StatusCard.vue`, covered end-to-end by
+    // `tests/nuxt/for-you-click-writers.test.ts`), so the risk moves to the
+    // *denominator*: only a tenth of impressions carry a card or media here,
+    // so dividing those heads by raw `impressions` would deflate them tenfold
+    // — the regression both source docs warn about hardest.
+    const n = 30_000
+    const media = n / 10
+    const report = measuredBaseRatesReport(counters({
+      impressions: n,
+      eligible: { hasLink: media, hasMedia: media, outOfNetwork: n },
+      actions: {
+        // Each conditional head observed at exactly its shipped rate *over its
+        // own eligible population*, so a correct denominator reproduces `B0`
+        // and a wrong one lands 10x low.
+        openLink: media * BASE_RATES.openLink,
+        photoExpand: media * BASE_RATES.photoExpand,
+        videoOpen: media * BASE_RATES.videoOpen,
+        profileClick: n * BASE_RATES.profileClick,
+      },
+    }))
+
+    expect(headReport(report, 'openLink').n).toBe(media)
+    expect(headReport(report, 'photoExpand').n).toBe(media)
+    expect(headReport(report, 'videoOpen').n).toBe(media)
+    // No eligibility gate: any impression could have produced an avatar tap.
+    expect(headReport(report, 'profileClick').n).toBe(n)
+
+    for (const head of ['openLink', 'photoExpand', 'videoOpen', 'profileClick'] as const)
+      expect(headReport(report, head).measured).toBeCloseTo(BASE_RATES[head], 12)
+  })
+
+  it('does not decay any head as impressions pile up, when the viewer acts at exactly the shipped rate', () => {
+    // The property the whole estimator rests on: every head observed at
+    // exactly its own shipped rate, over its *own* denominator, must reproduce
+    // `B0` at any sample size. Shrinkage is then a no-op, both side sums are
+    // unchanged, and the §6 rescale factors sit at 1.
+    //
+    // It is also the sharpest test of the denominators, because a head divided
+    // by the wrong population fails here and nowhere else: `openLink` and the
+    // media pair are observed over a tenth of impressions and `followAuthor`
+    // over the out-of-network share, so using raw `impressions` for any of
+    // them drives it visibly low and further low as `n` grows.
     const at = (n: number) => {
       const media = Math.round(n / 10)
       return measuredBaseRatesReport(counters({
@@ -207,6 +243,7 @@ describe('measuredBaseRatesReport — conditional heads use the eligible denomin
           openLink: media * BASE_RATES.openLink,
           photoExpand: media * BASE_RATES.photoExpand,
           videoOpen: media * BASE_RATES.videoOpen,
+          follow: n * BASE_RATES.followAuthor,
         },
       }))
     }
@@ -216,9 +253,22 @@ describe('measuredBaseRatesReport — conditional heads use the eligible denomin
     expect(small.applied).toBe(true)
     expect(large.applied).toBe(true)
 
-    // Unchanged from shipped at both sizes, and identical to each other.
-    expect(headReport(small, 'followAuthor').measured).toBeCloseTo(BASE_RATES.followAuthor, 12)
-    expect(headReport(large, 'followAuthor').measured).toBeCloseTo(BASE_RATES.followAuthor, 12)
+    // Unchanged from shipped at both sizes, for every head that has a writer.
+    for (const head of [
+      'favorite',
+      'reply',
+      'retweet',
+      'click',
+      'openLink',
+      'profileClick',
+      'photoExpand',
+      'videoOpen',
+      'followAuthor',
+      'notDwelled',
+    ] as const) {
+      expect(headReport(small, head).measured).toBeCloseTo(BASE_RATES[head], 12)
+      expect(headReport(large, head).measured).toBeCloseTo(BASE_RATES[head], 12)
+    }
   })
 
   it('divides every other measurable head by impressions', () => {

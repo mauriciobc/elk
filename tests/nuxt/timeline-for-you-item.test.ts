@@ -149,9 +149,13 @@ describe('timelineForYouItem', () => {
     dwellFlush.mockClear()
   })
 
-  async function mountItem(props: { status?: mastodon.v1.Status, relevance?: ForYouRelevanceReason } = {}) {
+  async function mountItem(props: {
+    status?: mastodon.v1.Status
+    relevance?: ForYouRelevanceReason
+    inNetwork?: boolean
+  } = {}) {
     const wrapper = await mountSuspended(TimelineForYouItem, {
-      props: { status: props.status ?? status(), relevance: props.relevance },
+      props: { status: props.status ?? status(), relevance: props.relevance, inNetwork: props.inNetwork },
     })
     await nextTick()
     await nextTick()
@@ -245,39 +249,60 @@ describe('timelineForYouItem', () => {
     expect(recordForYouImpressionMock).not.toHaveBeenCalled()
   })
 
-  it('records the impression with hasLink/hasMedia read off the status and outOfNetwork off the relevance prop', async () => {
+  it('records the impression with hasLink/hasMedia/authorId read off the status and outOfNetwork off the inNetwork prop', async () => {
     const withCardAndMedia = {
       ...status('post-2'),
       card: { url: 'https://example.com' },
       mediaAttachments: [{ id: 'm1', type: 'image' }],
     } as unknown as mastodon.v1.Status
 
-    const { observer } = await mountItem({ status: withCardAndMedia, relevance: undefined })
+    const { observer } = await mountItem({ status: withCardAndMedia, inNetwork: false })
     observer.emit(shortVisibleEntry())
 
     expect(recordForYouImpressionMock).toHaveBeenCalledTimes(1)
     expect(recordForYouImpressionMock).toHaveBeenCalledWith(withCardAndMedia, {
       hasLink: true,
       hasMedia: true,
-      // No `relevance` prop (out-of-network/no chip): not `'following'`.
       outOfNetwork: true,
+      authorId: withCardAndMedia.account.id,
     })
   })
 
-  it('treats relevance "following" as in-network, and anything else (or none) as out-of-network', async () => {
-    const inNetwork = await mountItem({ status: status('post-3'), relevance: 'following' })
-    inNetwork.observer.emit(shortVisibleEntry())
+  it('reads outOfNetwork off the inNetwork bit, not off the relevance label', async () => {
+    // The bit and the label are supplied independently by `feed.ts`. This
+    // drives them *against* each other on purpose: a post labelled `trending`
+    // whose author the viewer follows must still be counted as in-network,
+    // which the old `relevance !== 'following'` derivation got wrong. Nothing
+    // produces that combination today — `forYouRelevanceReason` returns
+    // `'following'` first — but the denominator must not depend on the chip's
+    // priority order or its copy staying the way it is.
+    const followed = await mountItem({ status: status('post-3'), relevance: 'trending', inNetwork: true })
+    followed.observer.emit(shortVisibleEntry())
     expect(recordForYouImpressionMock).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({ outOfNetwork: false }),
     )
     recordForYouImpressionMock.mockClear()
 
-    const trending = await mountItem({ status: status('post-4'), relevance: 'trending' })
-    trending.observer.emit(shortVisibleEntry())
+    const stranger = await mountItem({ status: status('post-4'), relevance: 'trending', inNetwork: false })
+    stranger.observer.emit(shortVisibleEntry())
     expect(recordForYouImpressionMock).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({ outOfNetwork: true }),
+    )
+  })
+
+  it('treats a missing inNetwork bit as in-network — undercounting the OON denominator is the safe failure', async () => {
+    // The chronological fallback emits statuses that never went through the
+    // ranker, so `feed.ts` has no `inNetwork` for them. Counting those as
+    // out-of-network would inflate `followAuthor`'s denominator with posts
+    // whose eligibility is unknown.
+    const { observer } = await mountItem({ status: status('post-6'), relevance: undefined })
+    observer.emit(shortVisibleEntry())
+
+    expect(recordForYouImpressionMock).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ outOfNetwork: false }),
     )
   })
 

@@ -24,6 +24,7 @@ const gridColumnNumber = computed(() => {
       <StatusAttachment
         :attachment="attachment"
         :attachments="status.mediaAttachments"
+        :status="status"
         :full-size="fullSize"
         w-full
         h-full

@@ -153,9 +153,21 @@ export const MASTODON_WEIGHTS: Record<keyof ActionProbabilities, number> = {
  *
  *   positive_sum 43.32 · negative_sum 367.22 · total_sum 410.54
  *
- * {@link weightSums} computes the same three numbers over *our* reduced head
- * table, which necessarily gives different values (18.25 / 367.22 / 385.47).
- * They are recorded here so nobody mistakes ours for X's.
+ * Two reductions of that stand between it and what we actually score with, and
+ * they are easy to conflate:
+ *
+ *   {@link X_WEIGHTS} over our 18 heads      18.25 / 367.22 / 385.47
+ *   {@link MASTODON_WEIGHTS}, what we score  12.75 / 367.22 / 379.97
+ *
+ * The first is X's table with the heads we do not model dropped; the second
+ * additionally applies our two deliberate weight changes (`quote` 5.0 → 1.0,
+ * `share` 2.0 → 0.5), and is the only one {@link weightSums} ever sees — it is
+ * called with {@link resolveWeights}, which returns `MASTODON_WEIGHTS`. The
+ * middle row is kept because it isolates "which heads" from "which weights";
+ * do not read it as ours. {@link X_WEIGHT_SUMS} below is neither.
+ *
+ * `tests/unit/for-you-ranking.test.ts` pins all three, so changing a weight
+ * without updating this block fails rather than quietly making it a lie.
  */
 export const X_WEIGHT_SUMS = { positiveSum: 43.32, negativeSum: 367.22, totalSum: 410.54 } as const
 
@@ -1051,7 +1063,22 @@ export function predictActions(
   signals: ForYouSignals,
   ctx: RankingContext,
 ): ActionProbabilities {
-  const f = extractRankingFeatures(candidate, signals, ctx)
+  return predictActionsFrom(candidate, extractRankingFeatures(candidate, signals, ctx), ctx)
+}
+
+/**
+ * {@link predictActions} over features the caller already has.
+ *
+ * The split exists because {@link scoreCandidate} needs the same
+ * `RankingFeatures` for its own context multiplier, and extracting them twice
+ * per candidate per page is pure waste. `predictActions` keeps its
+ * `(candidate, signals, ctx)` shape as the module's public entry point.
+ */
+function predictActionsFrom(
+  candidate: PostCandidate,
+  f: RankingFeatures,
+  ctx: RankingContext,
+): ActionProbabilities {
   const params = resolveParams(ctx)
   const B = resolveBaseRates(ctx)
 
@@ -1414,6 +1441,12 @@ export function predictActions(
 export function effectiveWeights(
   candidate: PostCandidate,
   ctx: RankingContext,
+  /**
+   * Features the caller already extracted, purely to avoid recomputing
+   * {@link videoDurationMs} — `RankingFeatures` already carries it. Omitting
+   * it is always safe and always gives the same answer.
+   */
+  f?: RankingFeatures,
 ): Record<keyof ActionProbabilities, number> {
   const base = resolveWeights(ctx)
   const params = resolveParams(ctx)
@@ -1425,7 +1458,7 @@ export function effectiveWeights(
       && !outer.reblog
       && !!ctx.mutualAuthorIds?.has(status.account?.id ?? '')
 
-  const durationMs = videoDurationMs(status)
+  const durationMs = f ? f.videoDurationMs : videoDurationMs(status)
   const vqvEligible
     = durationMs !== undefined
       && durationMs > MIN_VIDEO_DURATION_MS
@@ -1506,7 +1539,18 @@ export function contextMultiplier(
   signals: ForYouSignals,
   ctx: RankingContext,
 ): number {
-  const f = extractRankingFeatures(candidate, signals, ctx)
+  return contextMultiplierOf(extractRankingFeatures(candidate, signals, ctx))
+}
+
+/**
+ * {@link contextMultiplier} over features the caller already has — and the one
+ * definition of it. {@link scoreCandidate} used to inline `f.freshness *
+ * f.languagePrior` rather than call the exported function, which left two
+ * expressions for one quantity with only the test suite reading the exported
+ * one. If they ever disagreed, production would have been the one that was
+ * wrong and the tests would have kept passing.
+ */
+function contextMultiplierOf(f: RankingFeatures): number {
   return f.freshness * f.languagePrior
 }
 
@@ -1527,9 +1571,12 @@ export function scoreCandidate(
   signals: ForYouSignals,
   ctx: RankingContext,
 ): PostCandidate {
+  // Extracted once and threaded into everything below it: `predictActions`,
+  // `effectiveWeights` and the context multiplier all used to derive the same
+  // `RankingFeatures` independently, three times per candidate per page.
   const features = extractRankingFeatures(candidate, signals, ctx)
-  const probabilities = predictActions(candidate, signals, ctx)
-  const weights = effectiveWeights(candidate, ctx)
+  const probabilities = predictActionsFrom(candidate, features, ctx)
+  const weights = effectiveWeights(candidate, ctx, features)
   // Denominator from the *base* weights, once per request, as X does.
   const sums = weightSums(resolveWeights(ctx))
 
@@ -1550,7 +1597,7 @@ export function scoreCandidate(
 
   reasons.sort((a, b) => Math.abs(b.value) - Math.abs(a.value))
 
-  const context = features.freshness * features.languagePrior
+  const context = contextMultiplierOf(features)
   const net = pos - neg
   const scaled = net >= 0 ? context * net : net
 
@@ -1725,6 +1772,12 @@ export function applyNewAuthorBoost(
   const slot = lo + Math.floor(Math.random() * (hi - lo))
   const target = ranked[slot]!
 
+  // Unlike `scoreCandidate`, this recomputes `contentAgeMs`/`impressionProxy`
+  // per candidate rather than reading them off `RankingFeatures`. That is
+  // deliberate: `applyAdjustments` is handed `candidates` and `rawScore` only,
+  // so threading features here would widen its signature and `rankCandidates`'
+  // to save two arithmetic helpers that run once per slate. Not worth it.
+  //
   // positions_among_nonzero: rank only the candidates with a non-zero score.
   const order = scores
     .map((score, index) => ({ score, index }))

@@ -229,6 +229,63 @@ describe('x_WEIGHTS', () => {
   })
 })
 
+describe('scoreCandidate — one feature extraction, one context multiplier', () => {
+  // `scoreCandidate` extracts `RankingFeatures` once and threads them into
+  // `predictActions` and `effectiveWeights`, which used to derive the same
+  // features again on their own. This asserts the refactor kept the identity:
+  // the score is still exactly what the public pieces compose to.
+  //
+  // It also pins the part that was genuinely two sources of truth —
+  // `contextMultiplier` was exported and only tests called it, while
+  // production inlined `freshness * languagePrior` next to it. Nothing would
+  // have caught them drifting apart, and production is the copy that would
+  // have been wrong.
+  const cases: [string, CandidateOptions][] = [
+    ['a plain post', {}],
+    ['a popular post', { favouritesCount: 120, reblogsCount: 40, repliesCount: 12 }],
+    ['an old post', { minutesAgo: 60 * 40 }],
+    ['a post with a video', { videoDurationSecs: 30 }],
+    ['a post with images and tags', { images: 3, tags: ['baking', 'sourdough'] }],
+    ['a boost', { boostedBy: 'booster-1' }],
+    ['a reply', { inReplyToId: 'parent-1' }],
+  ]
+
+  it.each(cases)('reproduces the score of %s from predictActions x effectiveWeights x contextMultiplier', (_label, options) => {
+    const candidate = makeCandidate(options)
+    const s = signals()
+    const c = ctx()
+
+    const scored = scoreCandidate(candidate, s, c)
+
+    const probabilities = predictActions(candidate, s, c)
+    const weights = effectiveWeights(candidate, c)
+    let pos = 0
+    let neg = 0
+    for (const key of ACTION_KEYS) {
+      const term = probabilities[key] * weights[key]
+      if (term >= 0)
+        pos += term
+      else
+        neg -= term
+    }
+    const net = pos - neg
+    const scaled = net >= 0 ? contextMultiplier(candidate, s, c) * net : net
+
+    expect(scored.rawScore).toBe(offsetScore(scaled, weightSums(MASTODON_WEIGHTS)))
+  })
+
+  it('gives effectiveWeights the same answer with and without pre-extracted features', () => {
+    // The `f` parameter only exists to skip recomputing `videoDurationMs`, so
+    // a video post — the one case where that value is not `undefined` — has to
+    // land identically either way.
+    const candidate = makeCandidate({ videoDurationSecs: 30 })
+    const c = ctx({ viewerFollowerCount: 10 })
+    const features = extractRankingFeatures(candidate, signals(), c)
+
+    expect(effectiveWeights(candidate, c, features)).toEqual(effectiveWeights(candidate, c))
+  })
+})
+
 describe('mASTODON_WEIGHTS — what the ranker actually resolves', () => {
   it('differs from X in exactly two heads, and keeps the rest', () => {
     // The whole point of keeping both tables is that the delta is reviewable.
@@ -244,6 +301,24 @@ describe('mASTODON_WEIGHTS — what the ranker actually resolves', () => {
     for (const key of ['notInterested', 'muteAuthor', 'blockAuthor', 'report', 'notDwelled'] as const)
       expect(MASTODON_WEIGHTS[key]).toBe(X_WEIGHTS[key])
     expect(weightSums(MASTODON_WEIGHTS).negativeSum).toBeCloseTo(367.22, 10)
+  })
+
+  it('pins all three weight sums the X_WEIGHT_SUMS docblock quotes', () => {
+    // That block names three reductions of X's table and they are easy to
+    // conflate — the middle one drops the heads we do not model, the last one
+    // additionally applies our two weight changes, and only the last is what
+    // `weightSums` is ever called with (via `resolveWeights`). Quoting them in
+    // prose is how the block went stale when `MASTODON_WEIGHTS` was
+    // introduced; asserting them is how it stops.
+    expect(X_WEIGHT_SUMS).toEqual({ positiveSum: 43.32, negativeSum: 367.22, totalSum: 410.54 })
+
+    const ours = weightSums(X_WEIGHTS)
+    expect(ours.positiveSum).toBeCloseTo(18.25, 10)
+    expect(ours.totalSum).toBeCloseTo(385.47, 10)
+
+    const scored = weightSums(MASTODON_WEIGHTS)
+    expect(scored.positiveSum).toBeCloseTo(12.75, 10)
+    expect(scored.totalSum).toBeCloseTo(379.97, 10)
   })
 
   it('drops the phantom quote surcharge on every boost prediction', () => {

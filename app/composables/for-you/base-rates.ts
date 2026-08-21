@@ -1,4 +1,5 @@
 import type { ActionProbabilities, ForYouCounterAction, ForYouCounters } from './types'
+import { IN_BAND_MAX, IN_BAND_MIN } from '#shared/for-you'
 import { BASE_RATES, MASTODON_WEIGHTS } from './ranking'
 
 /**
@@ -20,7 +21,9 @@ import { BASE_RATES, MASTODON_WEIGHTS } from './ranking'
  * function this load-bearing has to be unit-testable without a store, a
  * component, or a browser. It imports `BASE_RATES` and `MASTODON_WEIGHTS`
  * from `ranking.ts` and nothing flows the other way; `ranking.ts` must never
- * import from this file, on pain of a circular import.
+ * import from this file, on pain of a circular import. The one other import,
+ * `#shared/for-you`, is a leafless constants module reachable from the Nitro
+ * side too — see its own docblock for why the guardrail band lives there.
  */
 
 /**
@@ -38,124 +41,136 @@ export const BASE_RATE_PRIOR_STRENGTH = 500
 /** One of the 18 heads `ActionProbabilities`/`BASE_RATES` key on. */
 type Head = keyof ActionProbabilities
 
-/**
- * All 18 heads, in the same order `BASE_RATES` declares them — used to drive
- * every loop below so the guardrail sums, the per-head report and the return
- * value all agree on iteration order without repeating the list.
- */
-const HEADS: Head[] = [
-  'favorite',
-  'reply',
-  'retweet',
-  'quote',
-  'share',
-  'click',
-  'openLink',
-  'profileClick',
-  'photoExpand',
-  'videoOpen',
-  'vqv',
-  'dwell',
-  'followAuthor',
-  'notInterested',
-  'muteAuthor',
-  'blockAuthor',
-  'report',
-  'notDwelled',
-]
+/** Which `ForYouCounters.eligible` sub-count gates a conditional head, if any. */
+type EligibleDenominator = keyof ForYouCounters['eligible']
 
 /**
- * Head → counter mapping (`INTERCEPT.md` §4). Fourteen of the eighteen heads
- * have a directly corresponding signal that `ForYouCounters.actions` records;
- * the heads absent from this map are handled by the §6 rescale below, never
- * by shrinkage of their own.
+ * How one head relates to the counters (`INTERCEPT.md` §4).
  *
- * `quote` and `dwell` and `profileClick` are measurable but carry weight 1.0,
- * 0.0 and 0.0 respectively today; they are measured anyway (`INTERCEPT.md`
- * §10.3) because it is cheap and leaves the head ready the moment a weight
- * changes.
+ * `counter` — a signal exists *and* something in the app writes it, so the
+ * head shrinks toward `B₀` by its own `k/n`.
+ *
+ * `no-signal` — there is no signal concept anywhere in the client; nothing
+ * could record it without inventing the event first. Keeps `B₀` and moves
+ * only through the §6 rescale.
+ *
+ * `unwired` — the signal exists in `ForYouEngagementKind` but nothing writes
+ * it, so its counter would be pinned at zero forever. **No head is in this
+ * state today**, and the variant is kept anyway, because the state is easy to
+ * re-enter (add a kind to `ForYouEngagementKind`, forget the call site) and
+ * silent when it happens.
+ *
+ * Leaving such a head classified `counter` is not neutral, which is the whole
+ * reason the distinction exists: shrinkage pins a head to `B₀` only when
+ * numerator and denominator sample the same population. With `k` nailed to 0
+ * and `n` climbing on every scroll, the estimate is `s·B₀ / (n + s)`, which
+ * decays toward zero without bound. Five heads were in exactly that state —
+ * measured on a realistic profile at `n = 30,000`: `openLink` 7x low,
+ * `photoExpand`/`videoOpen` 7x, `profileClick` 61x, and `followAuthor`
+ * structurally dead because `recordFollow`'s synthetic key can never match
+ * `impressed`. `N/P` stays inside `[0.1, 0.4]` throughout, so the §6.3
+ * guardrail does **not** catch it. Serving `B₀` is the honest answer while a
+ * head is in this state (`INTERCEPT-BUILD.md`: "count what is cheap to count
+ * correctly and let the estimator ignore the rest").
+ *
+ * Note what "unwired" is *not*: a head whose `k` is genuinely zero because the
+ * viewer never took the action. That is ordinary evidence and shrinkage is
+ * supposed to move on it. The distinction is whether a non-zero `k` is
+ * **possible**, not whether it has happened.
+ *
+ * The `counter`/`unwired` split is deliberately *only* about whether a writer
+ * exists — both carry the same `counter` key and the same `eligible`
+ * denominator, so wiring a call site is a one-word edit here and nothing else.
  */
-const HEAD_TO_COUNTER_ACTION: Partial<Record<Head, ForYouCounterAction>> = {
-  favorite: 'favourite',
-  retweet: 'reblog',
-  reply: 'reply',
-  quote: 'quote',
-  click: 'open',
-  dwell: 'dwell',
-  notDwelled: 'notDwelled',
-  notInterested: 'dismiss',
-  muteAuthor: 'mute',
+type HeadClass
+  = | { kind: 'counter', counter: ForYouCounterAction, eligible?: EligibleDenominator }
+    | { kind: 'no-signal' }
+    | { kind: 'unwired', counter: ForYouCounterAction, eligible?: EligibleDenominator }
+
+/**
+ * Every head, classified. The one table this module reads for *all* three
+ * questions it asks about a head: does it have a counter, which denominator
+ * does that counter divide by, and may shrinkage touch it.
+ *
+ * Typed `Record<Head, …>` rather than a `Partial`, and split across no other
+ * list: adding a 19th head to `ActionProbabilities` is a **compile error here
+ * until it is classified**, instead of silently falling through every loop
+ * below unshrunk, unrescaled and absent from the report. That is the same
+ * argument {@link sideOf}'s docblock makes for reading the sign off
+ * `MASTODON_WEIGHTS` instead of a hand-copied list, applied to the one place
+ * that used to hand-copy it.
+ *
+ * Declared in `BASE_RATES` order so {@link HEADS} — and therefore the debug
+ * report — reads in the order the shipped table declares. Nothing depends on
+ * that order for correctness (`splitSums` is order-insensitive and
+ * `buildPerHead` is display-only); it is a readability contract.
+ *
+ * `quote`, `dwell` and `profileClick` are measured despite carrying weight
+ * 1.0, 0.0 and 0.0 today (`INTERCEPT.md` §10.3): it is cheap, and it leaves
+ * the head ready the moment a weight changes.
+ */
+const HEAD_CLASS: Record<Head, HeadClass> = {
+  favorite: { kind: 'counter', counter: 'favourite' },
+  reply: { kind: 'counter', counter: 'reply' },
+  retweet: { kind: 'counter', counter: 'reblog' },
+  quote: { kind: 'counter', counter: 'quote' },
+  share: { kind: 'no-signal' },
+  click: { kind: 'counter', counter: 'open' },
+  openLink: { kind: 'counter', counter: 'openLink', eligible: 'hasLink' },
+  // No `eligible` gate: every impression could have produced an avatar tap,
+  // so the denominator is plain `impressions`.
+  profileClick: { kind: 'counter', counter: 'profileClick' },
+  photoExpand: { kind: 'counter', counter: 'photoExpand', eligible: 'hasMedia' },
+  videoOpen: { kind: 'counter', counter: 'videoOpen', eligible: 'hasMedia' },
+  vqv: { kind: 'no-signal' },
+  dwell: { kind: 'counter', counter: 'dwell' },
+  // The one head whose action is not about a post: `recordFollow` mints a
+  // synthetic `follow:<accountId>` key that can never be in `impressed`, so
+  // this is gated on `impressedAuthors` instead (`signals.ts`'s `counterGateFor`).
+  // Its denominator is `eligible.outOfNetwork` because `predictActions` gates
+  // the head on `!inNetwork` — following someone you already follow is not an
+  // action that exists, so in-network impressions were never eligible for it.
+  followAuthor: { kind: 'counter', counter: 'follow', eligible: 'outOfNetwork' },
+  notInterested: { kind: 'counter', counter: 'dismiss' },
+  muteAuthor: { kind: 'counter', counter: 'mute' },
+  blockAuthor: { kind: 'no-signal' },
+  report: { kind: 'no-signal' },
+  notDwelled: { kind: 'counter', counter: 'notDwelled' },
 }
 
 /**
- * Heads with no signal concept anywhere in the client (`INTERCEPT.md` §4).
- * Nothing could record them without inventing the event first.
+ * All 18 heads, in {@link HEAD_CLASS} declaration order — drives every loop
+ * below so the guardrail sums, the per-head report and the return value agree
+ * on iteration order. Derived, never hand-written: a hand-copied list would
+ * silently exclude a newly-added head from every sum and finiteness check.
  */
-const NO_SIGNAL_HEADS: Head[] = ['share', 'vqv', 'blockAuthor', 'report']
+const HEADS = Object.keys(HEAD_CLASS) as Head[]
 
 /**
- * Heads whose signal *exists* in `ForYouEngagementKind` but which nothing in
- * the app ever writes, so their counter is pinned at zero forever.
+ * The heads the §6 rescale moves: everything shrinkage is not allowed to
+ * touch, because nothing can ever put a count in their numerator. They track
+ * the aggregate move of their own side of `offsetScore`'s split instead of
+ * sitting frozen while their measured neighbours move around them.
  *
- * **This is a departure from `INTERCEPT.md` §4**, which asserts "fourteen of
- * eighteen heads are directly measurable from signals that exist today". The
- * signals exist as *types*; the call sites do not. Verified by searching the
- * whole of `app/` for anything that records each kind:
- *
- *   `openLink`      no writer — nothing records a card/link click
- *   `photoExpand`   no writer — nothing records opening an image
- *   `videoOpen`     no writer — nothing records starting a video
- *   `profileClick`  no writer — nothing records an avatar/name tap
- *   `followAuthor`  writer exists, but `recordFollow` stores a synthetic
- *                   `follow:<accountId>` key that can never be in `impressed`,
- *                   so the membership gate rejects every one
- *
- * Leaving them in the measurable set is not neutral, and this is the whole
- * reason the list exists. Shrinkage pins a head to `B₀` only when numerator
- * and denominator sample the same population. With `k` nailed to 0 and `n`
- * climbing on every scroll, the estimate is `s·B₀ / (n + s)`, which decays
- * toward zero without bound — measured on a realistic profile at
- * `n = 30,000`: `openLink` 7x low, `photoExpand`/`videoOpen` 7x, and
- * `profileClick` 61x. `N/P` stays inside `[0.1, 0.4]` throughout, so the §6.3
- * guardrail does **not** catch it.
- *
- * The real fix is to wire the missing call sites, at which point a head moves
- * back into {@link HEAD_TO_COUNTER_ACTION} and {@link denominatorFor} already
- * has the right denominator waiting for it. Until then, serving `B₀` is the
- * honest answer: `INTERCEPT-BUILD.md`'s own rule is to "count what is cheap to
- * count correctly and let the estimator ignore the rest".
+ * Derived from {@link HEAD_CLASS}, like {@link HEADS}, so classifying a head
+ * differently moves it in or out of this set with no second list to update.
  */
-const UNWIRED_HEADS: Head[] = ['followAuthor', 'openLink', 'profileClick', 'photoExpand', 'videoOpen']
-
-/** Everything that keeps `B₀` and moves only through the §6 rescale. */
-const UNMEASURABLE_HEADS: Head[] = [...NO_SIGNAL_HEADS, ...UNWIRED_HEADS]
+const RESCALE_HEADS = HEADS.filter(head => HEAD_CLASS[head].kind !== 'counter')
 
 /**
- * The eligible denominator for a head (`INTERCEPT.md` §3, §4). Two heads are
+ * The eligible denominator for a head (`INTERCEPT.md` §3, §4). Some heads are
  * conditionally gated — `openLink` only exists for a post with a card,
- * `photoExpand`/`videoOpen` only for a post with media — so dividing them by
- * raw `impressions` silently deflates them by the share of impressions that
- * could never have produced the action. This is called out in both source
- * docs as the single most-likely regression, so it gets its own function
- * rather than being folded inline into the shrinkage loop.
- *
- * None of these heads is currently measurable — nothing in the app records a
- * link click, a photo expand or a video open (see {@link UNWIRED_HEADS}) — so
- * this function is unreachable today. It is kept, correct and tested, because
- * it is exactly what those heads need the moment their call sites are wired,
- * and because getting the denominator wrong is the regression both source
- * docs warn about hardest.
+ * `photoExpand`/`videoOpen` only for a post with media, `followAuthor` only
+ * for an author not already followed — so dividing them by raw `impressions`
+ * silently deflates them by the share of impressions that could never have
+ * produced the action. This is called out in both source docs as the single
+ * most-likely regression, so it stays a named function rather than being
+ * folded inline into the shrinkage loop.
  */
 export function denominatorFor(head: Head, counters: ForYouCounters): number {
-  switch (head) {
-    case 'openLink':
-      return counters.eligible.hasLink
-    case 'photoExpand':
-    case 'videoOpen':
-      return counters.eligible.hasMedia
-    default:
-      return counters.impressions
-  }
+  const cls = HEAD_CLASS[head]
+  const eligible = cls.kind === 'no-signal' ? undefined : cls.eligible
+  return eligible ? counters.eligible[eligible] : counters.impressions
 }
 
 /**
@@ -211,11 +226,11 @@ export interface BaseRateHeadReport {
   head: Head
   /** The shipped `BASE_RATES` value for this head. */
   shipped: number
-  /** The value actually returned — shrunk for measurable heads, rescaled for the four that are not. */
+  /** The value actually returned — shrunk for `counter` heads, rescaled for the rest. */
   measured: number
-  /** Lifetime action count. `0` for the four unmeasurable heads — they have no counter. */
+  /** Lifetime action count. `0` for `no-signal`/`unwired` heads — nothing moves their counter. */
   k: number
-  /** The denominator used (`impressions` or the relevant `eligible.*`). `0` for unmeasurable heads and on the cold path. */
+  /** The denominator used (`impressions` or the relevant `eligible.*`). `0` for `no-signal`/`unwired` heads and on the cold path. */
   n: number
 }
 
@@ -259,9 +274,6 @@ function buildPerHead(
   }))
 }
 
-const IN_BAND_MIN = 0.1
-const IN_BAND_MAX = 0.4
-
 /**
  * The full computation behind {@link measuredBaseRates}, also exposing the
  * per-head detail the Step 7 debug sink needs (shipped vs measured, the `n`
@@ -288,18 +300,19 @@ export function measuredBaseRatesReport(
   }
 
   // ── per-head shrinkage ───────────────────────────────────────────────────
-  // Measurable heads shrink toward B₀ by their own k/n. Unmeasurable heads
-  // (`share`, `vqv`, `blockAuthor`, `report`) are left at B₀ here — the
-  // both-sides rescale below is the only thing allowed to move them.
+  // Only `counter` heads shrink toward B₀ by their own k/n. `no-signal` and
+  // `unwired` heads are left at B₀ here — the both-sides rescale below is the
+  // only thing allowed to move them (see {@link HeadClass} for why `unwired`
+  // must not shrink on a numerator that is structurally zero).
   const preRescale: Record<Head, number> = { ...shipped }
   const k: Partial<Record<Head, number>> = {}
   const n: Partial<Record<Head, number>> = {}
 
   for (const head of HEADS) {
-    const counterKey = HEAD_TO_COUNTER_ACTION[head]
-    if (!counterKey)
+    const cls = HEAD_CLASS[head]
+    if (cls.kind !== 'counter')
       continue
-    const kHead = counters.actions[counterKey] ?? 0
+    const kHead = counters.actions[cls.counter] ?? 0
     const nHead = denominatorFor(head, counters)
     k[head] = kHead
     n[head] = nHead
@@ -320,7 +333,7 @@ export function measuredBaseRatesReport(
   const negativeFactor = shippedSums.negative === 0 ? 1 : measuredSums.negative / shippedSums.negative
 
   const finalRates: Record<Head, number> = { ...preRescale }
-  for (const head of UNMEASURABLE_HEADS) {
+  for (const head of RESCALE_HEADS) {
     const factor = sideOf(head) === 'positive' ? positiveFactor : negativeFactor
     finalRates[head] = shipped[head] * factor
   }

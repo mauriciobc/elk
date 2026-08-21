@@ -419,6 +419,14 @@ export interface ForYouFeed {
    * scorer's own `.reasons`.
    */
   relevance: ReadonlyMap<string, ForYouRelevanceReason>
+  /**
+   * `status.id -> whether the author is followed`, for every post emitted so
+   * far. Carried separately from {@link relevance} because the impression
+   * record's `outOfNetwork` flag — the denominator behind the `followAuthor`
+   * base rate — must read the ranker's own `PostCandidate.inNetwork`, not a
+   * string comparison against a display label that a copy change could break.
+   */
+  inNetwork: ReadonlyMap<string, boolean>
 }
 
 // ---------------------------------------------------------------------------
@@ -496,6 +504,11 @@ interface FeedSession {
    * Vue's reactivity to need to track on the map itself.
    */
   relevance: Map<string, ForYouRelevanceReason>
+  /**
+   * `status.id -> PostCandidate.inNetwork`, kept alongside {@link relevance}
+   * rather than derived from it. Same lifetime and same non-reactive `Map`.
+   */
+  inNetwork: Map<string, boolean>
 }
 
 /**
@@ -720,6 +733,7 @@ export function useForYouFeed(options: ForYouFeedOptions = {}): ForYouFeed {
     isFallback: ref(false),
     exhausted: false,
     relevance: new Map(),
+    inNetwork: new Map(),
   }
 
   const signals = useForYouSignals()
@@ -742,6 +756,11 @@ export function useForYouFeed(options: ForYouFeedOptions = {}): ForYouFeed {
       signals: signals.value,
       limit: options.sourceLimit,
       maxTags: options.maxTags,
+      // The injected clock governs how old a *post* may be, so it has to reach
+      // the fetch side too — `drainPaginator`'s age gate would otherwise read
+      // wall-clock while the prescoring filters below read `options.now`.
+      // Undefined in production, where both fall back to `Date.now()`.
+      now: options.now?.(),
       filters: {
         // `ResultSizeFilter`: on a quiet instance, relaxing the discretionary
         // filters beats handing back half a page.
@@ -897,6 +916,12 @@ export function useForYouFeed(options: ForYouFeedOptions = {}): ForYouFeed {
       const reason = forYouRelevanceReason(candidate)
       if (reason)
         session.relevance.set(candidate.status.id, reason)
+      // Recorded as its own bit rather than recovered later from `reason`.
+      // `reason === 'following'` does mean `inNetwork` today — it is the first
+      // branch of `forYouRelevanceReason` — but that is a fact about the chip's
+      // priority order and its copy, and the impression's `outOfNetwork`
+      // denominator must not depend on either.
+      session.inNetwork.set(candidate.status.id, candidate.inNetwork)
     }
 
     if (statuses.length) {
@@ -1052,6 +1077,7 @@ export function useForYouFeed(options: ForYouFeedOptions = {}): ForYouFeed {
     checkStale,
     refresh,
     relevance: session.relevance,
+    inNetwork: session.inNetwork,
   }
 }
 

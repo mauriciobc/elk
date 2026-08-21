@@ -5,13 +5,23 @@ import { decode } from 'blurhash'
 
 const {
   attachment,
+  attachments,
   fullSize = false,
   isPreview = false,
+  status,
 } = defineProps<{
   attachment: mastodon.v1.MediaAttachment
   attachments?: mastodon.v1.MediaAttachment[]
   fullSize?: boolean
   isPreview?: boolean
+  /**
+   * The post this attachment belongs to, when the caller has it. Only used to
+   * record `photoExpand`/`videoOpen`; the attachment renders identically
+   * without it. Typed as widely as `StatusMedia`'s own prop, which also serves
+   * the edit-history viewer — a `StatusEdit` has no `id`, so it cannot be the
+   * subject of an engagement and is filtered out below.
+   */
+  status?: mastodon.v1.Status | mastodon.v1.StatusEdit
 }>()
 
 const src = computed(() => attachment.previewUrl || attachment.url || attachment.remoteUrl!)
@@ -73,6 +83,15 @@ const isGif = computed(() => attachment.type === 'gifv')
 const enableAutoplay = usePreferences('enableAutoplay')
 const unmuteVideos = usePreferences('unmuteVideos')
 
+/**
+ * True while the observer below is starting playback the viewer did not ask
+ * for. Read by {@link onVideoPlay}, which must count a *chosen* play and not
+ * an autoplayed one — see its docblock. Set before `play()` and cleared once
+ * the promise settles; the element's `play` event fires when playback begins,
+ * which is inside that window, so an autoplay is always covered.
+ */
+let autoplaying = false
+
 useIntersectionObserver(video, (entries) => {
   const ready = video.value?.dataset.ready === 'true'
   if (prefersReducedMotion.value === 'reduce' || !enableAutoplay.value) {
@@ -88,9 +107,12 @@ useIntersectionObserver(video, (entries) => {
         video.value?.pause()
     }
     else {
+      autoplaying = true
       video.value?.play().then(() => {
         video.value!.dataset.ready = 'true'
-      }).catch(noop)
+      }).catch(noop).finally(() => {
+        autoplaying = false
+      })
     }
   })
 }, { threshold: 0.75 })
@@ -101,6 +123,71 @@ const shouldLoadAttachment = ref(isPreview || !getPreferences(userSettings.value
 
 function loadAttachment() {
   shouldLoadAttachment.value = true
+}
+
+/**
+ * `photoExpand`/`videoOpen` — the click family's media heads
+ * (`ForYouEngagementKind`).
+ *
+ * Keyed on the rendered {@link type}, not `attachment.type`, so a server that
+ * reports `unknown` and gets classified by file extension is counted as
+ * whatever the viewer actually saw. `gifv` counts as a video, matching how
+ * `ranking.ts` reads the same attachment (`hasVideo`/`videoDurationMs` both
+ * treat `gifv` as one) — the numerator has to classify media the same way the
+ * features do. `audio` and a genuinely unresolvable `unknown` have no head and
+ * are deliberately silent rather than folded into either.
+ *
+ * Fires app-wide, like every other `recordEngagement` call — `signals.ts`'s
+ * population gate is what restricts the *counter* to posts For You actually
+ * put on screen.
+ */
+function recordMediaOpen() {
+  if (!status || !('id' in status))
+    return
+  if (type.value === 'image')
+    recordEngagement(status, 'photoExpand')
+  else if (type.value === 'video' || type.value === 'gifv')
+    recordEngagement(status, 'videoOpen')
+}
+
+/**
+ * What a tap on the attachment does: reveal it if data saving is holding it
+ * back, otherwise open the viewer. Both call sites in the template used to
+ * carry this as the same inline ternary; it is a named function now because
+ * the "otherwise" branch also has to record the engagement.
+ */
+function openOrLoad() {
+  if (!shouldLoadAttachment.value) {
+    loadAttachment()
+    return
+  }
+  recordMediaOpen()
+  openMediaPreview(attachments ?? [attachment], attachments?.indexOf(attachment) || 0)
+}
+
+/**
+ * The `video` branch never opens the media viewer — a video plays inline with
+ * its own controls — so its `videoOpen` cannot ride on {@link openOrLoad}, and
+ * a tap is the wrong event to hang it on either: the same button absorbs
+ * pause, seek, volume and fullscreen, so counting taps counts four things that
+ * are not "the viewer started a video".
+ *
+ * Playback beginning is the event that actually means the head. The reason not
+ * to use it used to be autoplay — the observer above starts videos the viewer
+ * never asked for, and counting those is exactly the correlated bias
+ * `INTERCEPT.md` §3 is about — so {@link autoplaying} suppresses precisely
+ * that case and nothing else. A viewer who pauses an autoplayed video and then
+ * resumes it *has* chosen to watch, and that resume counts.
+ */
+function onVideoPlay() {
+  if (!autoplaying)
+    recordMediaOpen()
+}
+
+/** The data-saving reveal, for the `video` branch. Playback is counted by {@link onVideoPlay}. */
+function tapVideo() {
+  if (!shouldLoadAttachment.value)
+    loadAttachment()
 }
 
 const blurHashSrc = computed(() => {
@@ -127,7 +214,7 @@ watch(shouldLoadAttachment, () => {
       <button
         type="button"
         relative
-        @click="!shouldLoadAttachment ? loadAttachment() : null"
+        @click="tapVideo"
       >
         <video
           ref="video"
@@ -147,6 +234,7 @@ watch(shouldLoadAttachment, () => {
             objectPosition,
           }"
           :class="!shouldLoadAttachment ? 'brightness-60 hover:brightness-70 transition-filter' : ''"
+          @play="onVideoPlay"
         >
           <source :src="attachment.url || attachment.previewUrl" type="video/mp4">
         </video>
@@ -167,7 +255,7 @@ watch(shouldLoadAttachment, () => {
       <button
         type="button"
         relative
-        @click="!shouldLoadAttachment ? loadAttachment() : openMediaPreview(attachments ? attachments : [attachment], attachments?.indexOf(attachment) || 0)"
+        @click="openOrLoad"
       >
         <video
           ref="video"
@@ -215,7 +303,7 @@ watch(shouldLoadAttachment, () => {
         w-full
         :aria-label="$t('action.open_image_preview_dialog')"
         relative
-        @click="!shouldLoadAttachment ? loadAttachment() : openMediaPreview(attachments ? attachments : [attachment], attachments?.indexOf(attachment) || 0)"
+        @click="openOrLoad"
       >
         <CommonBlurhash
           :blurhash="attachment.blurhash || ''"

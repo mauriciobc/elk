@@ -98,7 +98,8 @@ export type ForYouCounterAction = ForYouEngagementKindName | 'dismiss' | 'mute'
 /**
  * The engagement kinds, duplicated here as a string union rather than imported
  * from `signals.ts`: this file is the shared type root and must not depend on
- * the store. `signals.ts` asserts the two agree.
+ * the store. `signals.ts` asserts the two agree — `EngagementKindsAgree`,
+ * a bidirectional check, so drift in *either* direction fails typecheck.
  */
 export type ForYouEngagementKindName
   = | 'favourite'

@@ -5,6 +5,7 @@
  * and otherwise does nothing. It is inert in production builds.
  */
 /* eslint-disable no-console */
+import { IN_BAND_MAX, IN_BAND_MIN } from '#shared/for-you'
 
 interface ForYouDebugReason {
   label: string
@@ -48,19 +49,29 @@ interface ForYouDebugBaseRates {
   perHead: ForYouDebugBaseRateHead[]
 }
 
-const IN_BAND_MIN = 0.1
-const IN_BAND_MAX = 0.4
-
 function logBaseRates(baseRates: ForYouDebugBaseRates | undefined): void {
   if (!baseRates)
     return
 
   const { enabled, applied, ratio, perHead } = baseRates
+
+  // `applied: false` has two causes and they need different words. The type
+  // above says so, and printing "GUARDRAIL TRIPPED" for a fresh account said
+  // the opposite — next to an `N/P` that was visibly *inside* the band it
+  // claimed to be outside of.
+  //
+  // Cold is exactly "no head has a denominator yet": on the cold path
+  // `measuredBaseRatesReport` returns before the per-head loop, leaving every
+  // `n` at 0, while any `impressions > 0` gives the unconditional heads a
+  // non-zero `n` whether or not the guardrail then trips.
+  const measured = perHead.some(row => row.n > 0)
   const status = !enabled
     ? 'preference off — not personalizing'
     : applied
       ? 'applied'
-      : `GUARDRAIL TRIPPED — serving shipped rates (N/P outside [${IN_BAND_MIN}, ${IN_BAND_MAX}])`
+      : measured
+        ? `GUARDRAIL TRIPPED — serving shipped rates (N/P outside [${IN_BAND_MIN}, ${IN_BAND_MAX}])`
+        : 'cold — nothing measured yet, serving shipped rates'
 
   console.log(`[for-you] base rates — ${status}, N/P = ${ratio.toFixed(3)}`)
 

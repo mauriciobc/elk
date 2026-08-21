@@ -1,13 +1,23 @@
 <script setup lang="ts">
 import type { mastodon } from 'masto'
 
-const { status, relevance } = defineProps<{
+const { status, relevance, inNetwork } = defineProps<{
   status: mastodon.v1.Status
   // Passed straight through to `StatusCard` so reply threads still collapse.
   older?: mastodon.v1.Status
   newer?: mastodon.v1.Status
   /** Why this post is here — see `forYouRelevanceReason` in `feed.ts`. */
   relevance?: ForYouRelevanceReason
+  /**
+   * Whether the viewer follows this post's author, straight off the ranker's
+   * own `PostCandidate.inNetwork` (`ForYouFeed.inNetwork` in `feed.ts`) — the
+   * denominator behind the `followAuthor` base rate. Read as a bit rather than
+   * compared against `relevance`, which is a display label. Absent for a post
+   * that reached the list some other way (the chronological fallback), which
+   * the impression below treats as in-network: undercounting
+   * `eligible.outOfNetwork` is the safer failure.
+   */
+  inNetwork?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -110,17 +120,17 @@ useIntersectionObserver(
         markSeen([candidateKey(status)])
         // `hasLink`/`hasMedia` mirror `ranking.ts`'s `extractRankingFeatures`
         // (`!!status.card`, media attachments present) on the same
-        // boost-unwrapped content it scores. `outOfNetwork` cannot be read
-        // that way — a bare status carries no relationship context, and this
-        // component never receives the `PostCandidate` that has `inNetwork`
-        // — so it is read off the one thing here that is provably equivalent
-        // to it: `relevance === 'following'` iff `inNetwork` was true for
-        // this exact status (see `forYouRelevanceReason` in `feed.ts`).
+        // boost-unwrapped content it scores. `outOfNetwork` cannot be derived
+        // from a bare status at all — it needs relationship context — so it
+        // comes down as its own prop from the feed, which has the ranker's
+        // `PostCandidate.inNetwork`. `authorId` is the *content* author, never
+        // the booster: a boost is not a bid to follow whoever boosted it.
         const content = underlyingStatus(status)
         recordForYouImpression(status, {
           hasLink: !!content.card,
           hasMedia: (content.mediaAttachments?.length ?? 0) > 0,
-          outOfNetwork: relevance !== 'following',
+          outOfNetwork: inNetwork === false,
+          authorId: content.account?.id,
         })
       }
       dwell.enter()

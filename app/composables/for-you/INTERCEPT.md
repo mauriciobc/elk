@@ -205,12 +205,30 @@ total, which is why §3's `eligible` counters exist. Getting this wrong deflates
 `openLink`/`photoExpand`/`videoOpen` by the share of impressions that could
 never have produced them.
 
-**Every row above is gated on `impressed` membership** (§3). The signals in the
+**Every row above is gated on an observed population** (§3). The signals in the
 middle column all fire globally — `recordEngagement` from `masto/status.ts:88`,
 `recordFollow` from `relationship.ts:83` — so an ungated count would include
-actions on posts the For You feed never showed. `followAuthor` is the sharpest
-case: a follow initiated from a profile page or search has nothing to do with
-this feed, yet would land in the numerator over a For You denominator.
+actions on posts the For You feed never showed.
+
+For thirteen rows that population is `impressed`, the set of post ids For You
+put on screen. `followAuthor` is the exception, and it is a structural one: a
+follow is not an action on a post, and `recordFollow` mints a synthetic
+`follow:<accountId>` key that can never be in `impressed`, so gating it on posts
+pins its counter at zero forever no matter how many follows the viewer makes.
+It is gated on `impressedAuthors` instead — authors For You showed the viewer
+**out of network** — which is the same question asked of the only identifier a
+follow has, and pairs exactly with the `eligible.outOfNetwork` denominator the
+`!inNetwork` head gate implies.
+
+> **Writers.** When this spec was written, five of the fourteen rows had a
+> signal *type* but no call site: nothing in `app/` recorded a link click,
+> photo expand, video open or avatar tap, and `followAuthor` had the synthetic-
+> key problem above. They are wired now — `StatusPreviewCard.vue`,
+> `StatusAttachment.vue`, `StatusCard.vue`, and the `impressedAuthors`
+> attribution — with `tests/nuxt/for-you-click-writers.test.ts` driving real
+> DOM clicks so a writer that silently stops firing fails a test rather than
+> quietly returning its head to `B₀`. See `HeadClass` in `base-rates.ts` for
+> what that state costs and how it is now made unrepresentable.
 
 ## 5. Estimator: Beta-Binomial shrinkage toward the shipped value
 

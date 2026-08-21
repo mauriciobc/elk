@@ -191,15 +191,38 @@ area.
 
 Two heads have no status to gate membership on:
 
-- **`muteAuthor`** takes an `accountId` (`signals.ts:1294`) and is reachable from
-  `relationship.ts:113/142` (any surface) as well as
-  `TimelineForYouItem.vue:206`. Count only the For You call site.
-- **`followAuthor`** is a `recordFollow(account)` (`signals.ts:1029`) from
-  `relationship.ts:83`, with a synthetic `follow:<id>` key and no post at all.
+- **`muteAuthor`** takes an `accountId` and is reachable from
+  `relationship.ts`'s account-wide mute/block (any surface) as well as
+  `TimelineForYouItem.vue`'s "show less from author". Count only the For You
+  call site: it is the only one that passes a `statusId`, and
+  `bumpActionCounter`'s gate rejects the rest for free. **Accepted as-is.**
+- **`followAuthor`** is a `recordFollow(account)` from `relationship.ts:83`,
+  with a synthetic `follow:<id>` key and no post at all. **This one was not
+  accepted**, and the reasoning above turned out to be wrong for it.
 
-Neither is worth engineering around: both sit at ≥146% relative CI, so the
-shrinkage pins them to their priors regardless. Count what is cheap to count
-correctly and let the estimator ignore the rest.
+The argument for accepting both was that they "sit at ≥146% relative CI, so the
+shrinkage pins them to their priors regardless". That holds for `muteAuthor`,
+whose counter can move — a `k` of two or three over thousands of impressions
+genuinely cannot shift the estimate, which is shrinkage working as designed.
+
+It does not hold for `followAuthor`, because its counter could not move *at
+all*. A structurally-zero `k` over a climbing `n` is not a pinned prior, it is
+`s·B₀/(n + s)` decaying toward zero without bound, and at weight 4.0 that is the
+largest positive head in the table quietly going to nothing. "Cheap to count
+correctly" was the right rule applied to the wrong premise: the head was not
+expensive to count, it was being counted against the wrong population.
+
+The fix is `impressedAuthors` — authors For You showed out of network — gated by
+`counterGateFor` in `signals.ts`. It needs no change to any follow button,
+because it asks about the author rather than the post. What it does *not* catch:
+a viewer who sees an author, waits until they fall out of the 1000-author
+recency window, and only then follows them. That is the same shape of miss
+`impressed` already has for posts at `MAX_SEEN`, and it *is* worth accepting.
+
+The general rule survives, sharpened: **count what is cheap to count correctly,
+and let the estimator ignore the rest — but first check the head can produce a
+non-zero numerator at all.** A head that cannot is not being ignored by the
+estimator, it is being driven to zero by it.
 
 ## Done when
 
