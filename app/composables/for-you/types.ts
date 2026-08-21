@@ -67,6 +67,57 @@ export interface ScoreReason {
 }
 
 /**
+ * Lifetime observation counts for measured base rates (`INTERCEPT.md` §3).
+ *
+ * Raw observations, not derived state: unlike the affinity maps these are
+ * never decayed, never evicted, and must survive a `SIGNALS_VERSION` bump.
+ * They exist because `|engaged[kind]| / |seen|` is not an estimator — both
+ * sides are capped (`MAX_SIGNALS_PER_KIND` 50 over `MAX_SEEN` 3000), so that
+ * ratio saturates at 1.67% and systematically understates every head whose
+ * true rate is higher.
+ */
+export interface ForYouCounters {
+  /** For You impressions only — never `masto/routes.ts`'s `markSeen`. */
+  impressions: number
+  /** Impressions that were *eligible* for a conditionally-gated head. */
+  eligible: {
+    hasLink: number
+    hasMedia: number
+    outOfNetwork: number
+  }
+  /**
+   * Action counts over the same population as `impressions`, keyed by
+   * engagement kind plus the two non-engagement negatives.
+   */
+  actions: Partial<Record<ForYouCounterAction, number>>
+}
+
+/** What {@link ForYouCounters.actions} can key on. */
+export type ForYouCounterAction = ForYouEngagementKindName | 'dismiss' | 'mute'
+
+/**
+ * The engagement kinds, duplicated here as a string union rather than imported
+ * from `signals.ts`: this file is the shared type root and must not depend on
+ * the store. `signals.ts` asserts the two agree — `EngagementKindsAgree`,
+ * a bidirectional check, so drift in *either* direction fails typecheck.
+ */
+export type ForYouEngagementKindName
+  = | 'favourite'
+    | 'reblog'
+    | 'reply'
+    | 'quote'
+    | 'bookmark'
+    | 'follow'
+    | 'vote'
+    | 'open'
+    | 'openLink'
+    | 'profileClick'
+    | 'photoExpand'
+    | 'videoOpen'
+    | 'dwell'
+    | 'notDwelled'
+
+/**
  * The viewer's own engagement history. This is the only personalization signal
  * Mastodon gives us — there is no global cross-user engagement graph — so the
  * ranker leans on it far harder than Phoenix leans on any single feature.

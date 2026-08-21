@@ -1,6 +1,6 @@
 import type { mastodon } from 'masto'
 import type { Ref } from 'vue'
-import type { ForYouSignals } from './types'
+import type { ForYouCounterAction, ForYouCounters, ForYouEngagementKindName, ForYouSignals } from './types'
 
 /**
  * The viewer model for the "For You" feed.
@@ -39,7 +39,7 @@ import type { ForYouSignals } from './types'
 export const STORAGE_KEY_FOR_YOU_SIGNALS = 'elk-for-you-signals'
 
 /** Bumped when the persisted shape changes; see {@link normalizeSignals}. */
-export const SIGNALS_VERSION = 2
+export const SIGNALS_VERSION = 3
 
 /**
  * The engagements we can observe from the client.
@@ -83,6 +83,29 @@ export const ENGAGEMENT_KINDS: ForYouEngagementKind[] = [
   'notDwelled',
 ]
 
+/**
+ * `types.ts` duplicates {@link ForYouEngagementKind} as
+ * `ForYouEngagementKindName`, because it is the shared type root and must not
+ * depend on this store. This is the assertion that the two agree — and it
+ * checks *equality*, in both directions.
+ *
+ * One direction alone is not enough, which is why this is spelled out rather
+ * than left to the `COUNTER_ACTION_KEYS` spread below: that spread only proves
+ * `ForYouEngagementKind` is assignable *into* `ForYouCounterAction`, so adding
+ * a kind here without adding it there fails, but adding a name *there* which
+ * has no kind here passes silently — and `base-rates.ts` would then map a head
+ * to a counter nothing can ever write.
+ *
+ * The `[T] extends [U]` bracketing is deliberate: bare `extends` on a naked
+ * type parameter distributes over the union and would make this vacuously true.
+ */
+type EngagementKindsAgree
+  = [ForYouEngagementKind] extends [ForYouEngagementKindName]
+    ? [ForYouEngagementKindName] extends [ForYouEngagementKind] ? true : never
+    : never
+const _engagementKindsAgree: EngagementKindsAgree = true
+void _engagementKindsAgree
+
 /** One observed interaction, the client-side twin of X's `EngagementSignal`. */
 export interface EngagementSignal {
   /** `tweet_id`. For a follow, a synthetic `follow:<accountId>` id. */
@@ -117,6 +140,47 @@ export interface ForYouSignalsStore extends ForYouSignals {
   dismissed: EngagementSignal[]
   /** Derived, like the affinity maps: accountId -> weight for *boosters*. */
   boosterAffinity: Record<string, number>
+  /**
+   * Lifetime observation counts for measured base rates (`INTERCEPT.md` §3).
+   *
+   * Raw observations, not derived state: unlike the affinity maps above,
+   * these are never decayed, never evicted, and must survive a
+   * `SIGNALS_VERSION` bump — see the `stale` handling in
+   * {@link normalizeSignals}. `|engaged[kind]| / |seen|` looks like the
+   * estimator and is not one, because both sides are capped
+   * (`MAX_SIGNALS_PER_KIND` over `MAX_SEEN`) and the numerator is also
+   * decayed; these counters exist to be the honest ratio instead.
+   */
+  counters: ForYouCounters
+  /**
+   * Ids For You actually put on screen — the population `counters` measures
+   * against. Bounded and evicted like `seen` (same {@link MAX_SEEN}), but a
+   * genuinely separate array: `seen` is also written from
+   * `masto/routes.ts`'s status-detail navigation, which is not a For You
+   * impression and must never be mistaken for one (the "population trap",
+   * `INTERCEPT.md` §3). Written only from {@link recordForYouImpression}.
+   */
+  impressed: string[]
+  /**
+   * Authors For You put on screen **out of network** — the population
+   * `followAuthor`'s numerator is drawn from, and the one head that cannot use
+   * {@link impressed}.
+   *
+   * A follow is not an action on a *post*: `toggleFollowAccount` fires from
+   * profile pages, hover cards, account lists and the report modal, none of
+   * which has a status in scope, and `recordFollow` stores a synthetic
+   * `follow:<accountId>` key that can never be in `impressed`. Attributing by
+   * author instead is what makes the head measurable at all — and it is the
+   * right population, because `predictActions` gates `followAuthor` on
+   * `!inNetwork` (following someone you already follow is not an action that
+   * exists), which is exactly the `eligible.outOfNetwork` denominator this
+   * pairs with.
+   *
+   * Raw observation like {@link impressed} and {@link counters}, but a recency
+   * list rather than an append buffer: capped at {@link MAX_IMPRESSED_AUTHORS}
+   * with a re-impression moving the author back to the front.
+   */
+  impressedAuthors: string[]
 }
 
 /**
@@ -167,6 +231,23 @@ export interface ForYouSignalsStore extends ForYouSignals {
  * into a within-sign percentile, so only the induced order matters downstream.
  * That makes {@link MIN_EVIDENCE} and {@link EVIDENCE_CAP} more load-bearing
  * than the numbers here.
+ *
+ * **On `openLink`/`profileClick`/`photoExpand`/`videoOpen` now being live.**
+ * These four sat in this table with real weights while nothing in the app
+ * called {@link recordEngagement} for them, so they contributed nothing. Their
+ * writers are wired now (`StatusPreviewCard.vue`, `StatusAttachment.vue`,
+ * `StatusCard.vue`), which means they feed **affinity**, not just the
+ * measurement counters — and affinity is read by the ranker whether or not the
+ * `personalizeForYouRanking` preference is on.
+ *
+ * That is deliberate, and it is not a new class of behaviour: `open` has been
+ * wired globally at `masto/routes.ts:97` all along at this same 0.5, so the
+ * feed has always taken weak click signals as evidence. These four are the
+ * rest of the same family, at or below its weight, and the affinity maps decay
+ * and are capped ({@link EVIDENCE_CAP}), so no amount of casual tapping can
+ * dominate a favourite or a follow. Zero them here if that trade is ever
+ * unwanted — the counters would keep working, because the population gate is
+ * what governs those, not this table.
  */
 export const ENGAGEMENT_STRENGTH: Record<ForYouEngagementKind, number> = {
   follow: 5,
@@ -292,6 +373,17 @@ export const MAX_SEEN = 3000
 const MAX_NOT_INTERESTED = 500
 /** `AuthorSocialgraphFilter`'s muted set, bounded like everything else here. */
 export const MAX_MUTED = 500
+/**
+ * Authors seen out-of-network in For You — the population `followAuthor`'s
+ * numerator is drawn from (see {@link recordForYouImpressionInSignals}).
+ *
+ * Smaller than {@link MAX_SEEN} on purpose: this is authors, not posts, and a
+ * feed that shows the same stranger three times only adds one entry. It is a
+ * **recency** list, not an observation buffer — a re-impression moves the author
+ * back to the front — so at the cap it holds the most recent 1000 strangers,
+ * which is a far longer window than the follow decision it has to survive.
+ */
+export const MAX_IMPRESSED_AUTHORS = 1000
 
 /** Affinities halve every two weeks, so yesterday's binge does not ossify. */
 export const DECAY_HALF_LIFE_MS = 14 * 24 * 60 * 60 * 1000
@@ -368,7 +460,101 @@ export function createEmptySignals(): ForYouSignalsStore {
     notInterested: [],
     mutedForYou: [],
     lastDecay: 0,
+    counters: {
+      impressions: 0,
+      eligible: { hasLink: 0, hasMedia: 0, outOfNetwork: 0 },
+      actions: {},
+    },
+    impressed: [],
+    impressedAuthors: [],
   }
+}
+
+/** Every key {@link ForYouCounters.actions} can be indexed by. */
+const COUNTER_ACTION_KEYS: ForYouCounterAction[] = [...ENGAGEMENT_KINDS, 'dismiss', 'mute']
+
+function nonNegativeNumber(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 0
+}
+
+/** Repairs a persisted `counters` blob the same way the rest of the store is repaired. */
+function normalizeCounters(value: unknown): ForYouCounters {
+  const raw = isRecord(value) ? value : {}
+  const rawEligible = isRecord(raw.eligible) ? raw.eligible : {}
+  const rawActions = isRecord(raw.actions) ? raw.actions : {}
+
+  const actions: Partial<Record<ForYouCounterAction, number>> = {}
+  for (const key of COUNTER_ACTION_KEYS) {
+    const n = nonNegativeNumber(rawActions[key])
+    if (n > 0)
+      actions[key] = n
+  }
+
+  return {
+    impressions: nonNegativeNumber(raw.impressions),
+    eligible: {
+      hasLink: nonNegativeNumber(rawEligible.hasLink),
+      hasMedia: nonNegativeNumber(rawEligible.hasMedia),
+      outOfNetwork: nonNegativeNumber(rawEligible.outOfNetwork),
+    },
+    actions,
+  }
+}
+
+/**
+ * Which observed population a counter's numerator has to belong to.
+ *
+ * Almost everything is `{ post }`: the action happened *to a post*, and only
+ * posts For You put on screen may count. `{ author }` exists for the one head
+ * whose action is not about a post at all — `followAuthor` — see
+ * {@link ForYouSignalsStore.impressedAuthors}.
+ */
+type CounterGate = { post: string | undefined } | { author: string | undefined }
+
+/**
+ * Adjusts one action counter, floored at 0 so a retraction can never drive it
+ * negative. Deletes the key at zero rather than storing it, matching how
+ * `engaged[kind]` only appears on the store when it is non-empty.
+ *
+ * **`gate` is the population check, and it is mandatory** — the single most
+ * load-bearing rule of the whole measurement, so it lives here rather than
+ * being re-asserted at each of the six call sites. A counter only moves when
+ * the thing acted on was actually put on screen *by For You*:
+ *
+ *  - `recordEngagement` is wired globally (`masto/status.ts:88`, and now the
+ *    click family in `StatusCard`/`StatusAttachment`/`StatusPreviewCard`) and
+ *    fires anywhere in the app. Counting all of it over a For You-only
+ *    denominator would overstate every rate with a *correlated* bias — a post
+ *    the viewer deliberately navigated to has a far higher action rate than
+ *    one that merely scrolled past (`INTERCEPT.md` §3);
+ *  - `applyMuteToSignals` is reachable from `relationship.ts`'s account-wide
+ *    mute/block, which has no post at all. Those callers pass `{ post:
+ *    undefined }` and so are naturally never counted — that is the mechanism,
+ *    not an oversight (`INTERCEPT-BUILD.md`, "Attribution gaps to accept");
+ *  - retractions are symmetric: an un-favourite of a post that was never
+ *    impressed never bumped the counter, so it must not decrement it either,
+ *    or the floor-at-0 clamp would eat a *different* action's headroom the
+ *    moment counts happen to cross.
+ *
+ * The gate only touches the counter. Signals and affinity are recorded exactly
+ * as they always were, whether or not the post was impressed here.
+ */
+function bumpActionCounter(
+  signals: ForYouSignalsStore,
+  action: ForYouCounterAction,
+  delta: number,
+  gate: CounterGate,
+) {
+  const observed = 'post' in gate
+    ? !!gate.post && signals.impressed.includes(gate.post)
+    : !!gate.author && signals.impressedAuthors.includes(gate.author)
+  if (!observed)
+    return
+  const next = Math.max(0, (signals.counters.actions[action] ?? 0) + delta)
+  if (next > 0)
+    signals.counters.actions[action] = next
+  else
+    delete signals.counters.actions[action]
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -499,6 +685,12 @@ export function normalizeSignals(raw: unknown): { signals: ForYouSignalsStore, c
     notInterested: normalizeStringList(raw.notInterested, MAX_NOT_INTERESTED),
     mutedForYou: normalizeStringList(raw.mutedForYou, MAX_MUTED),
     lastDecay: typeof raw.lastDecay === 'number' && Number.isFinite(raw.lastDecay) ? raw.lastDecay : 0,
+    // Raw observations, not derived: kept regardless of `stale`, unlike the
+    // affinity maps above — a `SIGNALS_VERSION` bump must not silently reset
+    // the calibration data (`INTERCEPT.md` §3, "Version discipline").
+    counters: normalizeCounters(raw.counters),
+    impressed: normalizeStringList(raw.impressed, MAX_SEEN),
+    impressedAuthors: normalizeStringList(raw.impressedAuthors, MAX_IMPRESSED_AUTHORS),
   }
 
   return { signals, changed: !deepEqual(raw, signals) }
@@ -581,7 +773,31 @@ export function recordSignal(
 
   const list = signals.engaged[kind] ?? []
   signals.engaged[kind] = sortDedupTruncate([signal, ...list], maxSignalsFor(kind))
+
+  // The signal above is recorded unconditionally; only the counter is gated on
+  // this post — or, for a follow, this author — having been put on screen by
+  // For You (see `bumpActionCounter` and `counterGateFor`).
+  bumpActionCounter(signals, kind, 1, counterGateFor(kind, signal.statusId, signal.authorId))
+
   return deriveAffinities(signals, now)
+}
+
+/**
+ * Which population gates this kind's counter.
+ *
+ * `follow` is the sole exception and it is a structural one, not a preference:
+ * its `statusId` is the synthetic `follow:<accountId>` key {@link recordFollow}
+ * mints, which can never appear in `impressed`, so gating it on posts pins the
+ * counter at zero forever no matter how many follows the viewer makes. The
+ * author it names *can* be in `impressedAuthors`, which is the same question
+ * asked of the only identifier a follow actually has.
+ */
+function counterGateFor(
+  kind: ForYouEngagementKind,
+  statusId: string | undefined,
+  authorId: string | undefined,
+): CounterGate {
+  return kind === 'follow' ? { author: authorId } : { post: statusId }
 }
 
 /** Undoes an engagement (un-favourite, un-follow…). Mutates and returns `signals`. */
@@ -594,10 +810,18 @@ export function forgetSignal(
   const list = signals.engaged[kind]
   if (!list?.length)
     return signals
+  // Captured before the filter: an un-follow arrives as the synthetic
+  // `follow:<accountId>` key, and the author it was recorded against is the
+  // only thing that can answer the gate below.
+  const removed = list.find(signal => signal.statusId === statusId)
   const next = list.filter(signal => signal.statusId !== statusId)
   if (next.length === list.length)
     return signals
   signals.engaged[kind] = next
+
+  // Symmetric with the increment in `recordSignal`, through the same gate.
+  bumpActionCounter(signals, kind, -1, counterGateFor(kind, statusId, removed?.authorId))
+
   return deriveAffinities(signals, now)
 }
 
@@ -621,6 +845,8 @@ export function applyNotInterestedToSignals(
     if (list?.some(entry => entry.statusId === statusId))
       signals.engaged[kind] = list.filter(entry => entry.statusId !== statusId)
   }
+
+  bumpActionCounter(signals, 'dismiss', 1, { post: statusId })
 
   return deriveAffinities(signals, now)
 }
@@ -653,22 +879,45 @@ export function forgetNotInterestedToSignals(
 
   const before = signals.dismissed.length
   signals.dismissed = signals.dismissed.filter(signal => signal.statusId !== statusId)
+  const dismissalRemoved = signals.dismissed.length !== before
 
-  if (at === -1 && signals.dismissed.length === before)
+  if (at === -1 && !dismissalRemoved)
     return signals
+
+  // Mirrors the increment in `applyNotInterestedToSignals`: only decrement
+  // when a dismissal actually existed to undo. The population gate and the
+  // floor at 0 are both `bumpActionCounter`'s.
+  if (dismissalRemoved)
+    bumpActionCounter(signals, 'dismiss', -1, { post: statusId })
+
   return deriveAffinities(signals, now)
 }
 
-/** Mutes an author for this feed only. Mutates and returns `signals`. */
+/**
+ * Mutes an author for this feed only. Mutates and returns `signals`.
+ *
+ * `muteAuthor` has no post of its own to gate a counter on — it takes an
+ * `accountId` — and this same function is reachable from three surfaces:
+ * `TimelineForYouItem.vue`'s "show less from author" (a genuine For You
+ * action) and `relationship.ts`'s account-wide mute/block (reachable from
+ * anywhere, nothing to do with this feed). `INTERCEPT-BUILD.md`'s
+ * "Attribution gaps to accept, not solve" calls for counting only the For
+ * You call site rather than engineering a real fix, so `statusId` is
+ * optional and *only* the For You call site passes one. `bumpActionCounter`'s
+ * gate then does the rest: no `statusId` means no count, so the two
+ * account-wide call sites naturally never move the counter.
+ */
 export function applyMuteToSignals(
   signals: ForYouSignalsStore,
   accountId: string,
   now: number = Date.now(),
+  statusId?: string,
 ): ForYouSignalsStore {
   if (!accountId)
     return signals
   if (!signals.mutedForYou.includes(accountId))
     pushCapped(signals.mutedForYou, accountId, MAX_MUTED)
+  bumpActionCounter(signals, 'mute', 1, { post: statusId })
   return deriveAffinities(signals, now)
 }
 
@@ -841,6 +1090,31 @@ export function decaySignalsInPlace(
 }
 
 /**
+ * Appends `id` to a capped, deduped ring buffer, evicting the oldest first and
+ * keeping `set` in sync incrementally. Returns whether the id was *new* — the
+ * caller's cue that a first-time observation just happened.
+ *
+ * **Not the same as {@link pushCapped}.** That one moves an id already in the
+ * list to the end, because `notInterested`/`mutedForYou` are recency lists
+ * where a repeat is the newest evidence. This one leaves an existing id where
+ * it is and reports `false`, because `seen`/`impressed` are *observation*
+ * buffers where a repeat is a duplicate to be ignored. Do not unify them: the
+ * impression counters depend on this one's dedupe being exact.
+ */
+function appendCappedUnique(list: string[], id: string, set: Set<string>, max: number): boolean {
+  if (!id || set.has(id))
+    return false
+  set.add(id)
+  list.push(id)
+  if (list.length > max) {
+    const evicted = list.splice(0, list.length - max)
+    for (const gone of evicted)
+      set.delete(gone)
+  }
+  return true
+}
+
+/**
  * Appends ids to the seen ring buffer, evicting the oldest first.
  *
  * `index`, when given, is kept in sync incrementally: this runs on the scroll
@@ -853,17 +1127,106 @@ export function markSeenInSignals(
   index?: Set<string>,
 ): ForYouSignalsStore {
   const set = index ?? new Set(signals.seen)
-  for (const id of ids) {
-    if (!id || set.has(id))
-      continue
-    set.add(id)
-    signals.seen.push(id)
+  for (const id of ids)
+    appendCappedUnique(signals.seen, id, set, MAX_SEEN)
+  return signals
+}
+
+/**
+ * Eligibility flags for an impression's conditionally-gated heads
+ * (`openLink`/`photoExpand`+`videoOpen`/`followAuthor`), computed once at the
+ * impression call site.
+ *
+ * `hasLink`/`hasMedia` are structural — derivable from the status alone, the
+ * same way `ranking.ts`'s `extractRankingFeatures` reads them. `outOfNetwork`
+ * is not: it needs relationship context a bare `mastodon.v1.Status` does not
+ * carry (`PostCandidate.inNetwork` lives on the *candidate*, one layer up), so
+ * it has to be supplied by whoever has that context — `TimelineForYouItem.vue`
+ * takes it from the feed rather than reconstructing it.
+ */
+export interface ForYouImpressionFlags {
+  hasLink: boolean
+  hasMedia: boolean
+  outOfNetwork: boolean
+  /**
+   * The *content* author (the boosted post's, never the booster's), recorded
+   * into {@link ForYouSignalsStore.impressedAuthors} when this impression is
+   * out of network. Optional so a caller with only a bare status can still
+   * record an impression; a missing author simply leaves `followAuthor`
+   * unattributable for this one post.
+   */
+  authorId?: string
+}
+
+/**
+ * What {@link recordForYouImpressionInSignals} accepts: a full status — from
+ * which it derives `hasLink`/`hasMedia` itself, and treats as in-network
+ * (undercounting `eligible.outOfNetwork` is the safer failure than guessing
+ * from nothing) — or a caller-computed id-plus-flags object, for a caller
+ * that has more context than a bare status carries.
+ */
+type ForYouImpressionInput = mastodon.v1.Status | ({ id: string } & ForYouImpressionFlags)
+
+function isImpressionFlags(input: ForYouImpressionInput): input is { id: string } & ForYouImpressionFlags {
+  return 'hasLink' in input && 'hasMedia' in input && 'outOfNetwork' in input
+}
+
+function resolveImpressionFlags(input: ForYouImpressionInput): { id: string } & ForYouImpressionFlags {
+  if (isImpressionFlags(input))
+    return input
+  const content = input.reblog ?? input
+  return {
+    id: input.reblog?.id ?? input.id,
+    hasLink: !!content.card,
+    hasMedia: (content.mediaAttachments?.length ?? 0) > 0,
+    outOfNetwork: false,
+    authorId: content.account?.id,
   }
-  if (signals.seen.length > MAX_SEEN) {
-    const evicted = signals.seen.splice(0, signals.seen.length - MAX_SEEN)
-    for (const id of evicted)
-      set.delete(id)
+}
+
+/**
+ * Records a genuine For You impression: appends to `impressed` (deduped,
+ * evicted oldest-first at {@link MAX_SEEN}, mirroring
+ * {@link markSeenInSignals} above) and increments `counters.impressions` plus
+ * whichever `eligible` counters this impression qualifies for.
+ *
+ * Only increments anything when the id was *not* already in `impressed` — a
+ * re-impression of the same post (rapid scroll re-triggering the observer,
+ * or the same post resurfacing on a later page) must not double-count,
+ * exactly as {@link markSeenInSignals} dedupes. `index`, like there, lets the
+ * hot path (one call per post that scrolls into view) avoid rebuilding a
+ * few-thousand-entry `Set` on every call.
+ */
+export function recordForYouImpressionInSignals(
+  signals: ForYouSignalsStore,
+  input: ForYouImpressionInput,
+  index?: Set<string>,
+): ForYouSignalsStore {
+  const flags = resolveImpressionFlags(input)
+  if (!flags.id)
+    return signals
+
+  const set = index ?? new Set(signals.impressed)
+  if (!appendCappedUnique(signals.impressed, flags.id, set, MAX_SEEN))
+    return signals
+
+  signals.counters.impressions++
+  if (flags.hasLink)
+    signals.counters.eligible.hasLink++
+  if (flags.hasMedia)
+    signals.counters.eligible.hasMedia++
+  if (flags.outOfNetwork) {
+    signals.counters.eligible.outOfNetwork++
+    // `pushCapped`, not `appendCappedUnique`: this is a recency list, so a
+    // stranger seen again moves back to the front rather than being ignored.
+    // It is deliberately outside the impression dedupe's effect on *counters*
+    // — a second impression of the same post does not reach here at all, but a
+    // different post by the same author does, and refreshing the author is the
+    // point.
+    if (flags.authorId)
+      pushCapped(signals.impressedAuthors, flags.authorId, MAX_IMPRESSED_AUTHORS)
   }
+
   return signals
 }
 
@@ -927,6 +1290,45 @@ export function dismissedAuthorIdsIn(signals: ForYouSignals | ForYouSignalsStore
 // Reactive, per-account surface.
 // ---------------------------------------------------------------------------
 
+function signalsOwnerKey() {
+  return currentUser.value?.account.acct ?? '[anonymous]'
+}
+
+/**
+ * A memoized `Set` view over one of the store's plain id arrays.
+ *
+ * `seen` and `impressed` are plain arrays in storage, but both are asked "is
+ * this id in here?" once per candidate (the ranker's `isSeen`) or once per post
+ * that scrolls into view (the impression observer) — so neither can go
+ * quadratic, and neither can afford to rebuild a few-thousand-entry `Set` per
+ * call.
+ *
+ * The cache is keyed on the account *and* on the identity of the array it
+ * indexes, so an account switch or a cross-tab write (which replaces the whole
+ * object through the `storage` event, keeping the length identical at
+ * saturation) invalidates it. Both conditions are subtle enough that having
+ * them written out twice, once per array, was a standing invitation to fix one
+ * and not the other.
+ */
+function createIdIndex(sourceOf: (signals: ForYouSignalsStore) => string[]) {
+  let index: { key: string, source: string[], set: Set<string> } | undefined
+  return {
+    get(signals: ForYouSignalsStore): Set<string> {
+      const key = signalsOwnerKey()
+      const source = sourceOf(signals)
+      if (!index || index.key !== key || index.source !== source)
+        index = { key, source, set: new Set(source) }
+      return index.set
+    },
+    invalidate() {
+      index = undefined
+    },
+  }
+}
+
+const seenIndex = createIdIndex(signals => signals.seen)
+const impressedIndex = createIdIndex(signals => signals.impressed)
+
 /**
  * Stores whose shape has already been checked, keyed by object identity.
  *
@@ -935,7 +1337,7 @@ export function dismissedAuthorIdsIn(signals: ForYouSignals | ForYouSignalsStore
  * over a tenth of a second re-validating an object it validated microseconds
  * earlier. Validation is idempotent and the store only changes identity when
  * the account switches or another tab replaces it, so identity is exactly the
- * right cache key (the same trick `seenIndex` uses below). A `WeakSet` means a
+ * right cache key (the same trick `createIdIndex` uses above). A `WeakSet` means a
  * signed-out account's store is collectable.
  */
 const validatedStores = new WeakSet<object>()
@@ -968,7 +1370,8 @@ export function useForYouSignals(): Ref<ForYouSignalsStore> {
   // whether it was needed: the ref from `useUserLocalStorage` is a computed
   // with no setter, so this has to be an in-place merge either way.
   Object.assign(store, normalizeSignals(store).signals)
-  invalidateSeenIndex()
+  seenIndex.invalidate()
+  impressedIndex.invalidate()
   deriveAffinities(store)
 
   return signals
@@ -1230,40 +1633,39 @@ export function recordComposedStatus(created: mastodon.v1.Status | undefined) {
   }
 }
 
-// `seen` is a plain array in storage; keep a Set alongside it so the ranker can
-// ask `isSeen` once per candidate without going quadratic. The cache is keyed
-// on the account *and* on the identity of the array it indexes, so an account
-// switch or a cross-tab write (which replaces the whole object through the
-// `storage` event, keeping the length identical at saturation) invalidates it.
-let seenIndex: { key: string, source: string[], set: Set<string> } | undefined
-
-function invalidateSeenIndex() {
-  seenIndex = undefined
-}
-
-function signalsOwnerKey() {
-  return currentUser.value?.account.acct ?? '[anonymous]'
-}
-
-function getSeenSet(signals: ForYouSignalsStore) {
-  const key = signalsOwnerKey()
-  if (!seenIndex || seenIndex.key !== key || seenIndex.source !== signals.seen)
-    seenIndex = { key, source: signals.seen, set: new Set(signals.seen) }
-  return seenIndex.set
-}
-
 /** Remembers posts already shown, mirroring `PreviouslySeenPostsFilter`. */
 export function markSeen(ids: string[]) {
   if (!import.meta.client || !ids.length)
     return
   const signals = useForYouSignals().value
-  markSeenInSignals(signals, ids, getSeenSet(signals))
+  markSeenInSignals(signals, ids, seenIndex.get(signals))
 }
 
 export function isSeen(id: string): boolean {
   if (!import.meta.client)
     return false
-  return getSeenSet(useForYouSignals().value).has(id)
+  return seenIndex.get(useForYouSignals().value).has(id)
+}
+
+/**
+ * Records a genuine For You impression — `TimelineForYouItem.vue`'s latched
+ * `isMeaningfullyVisible` observer, and *only* that: `masto/routes.ts:98`'s
+ * `markSeen` call (a status-detail navigation, from anywhere) must never
+ * reach this, or the numerator/denominator population match the whole
+ * measurement depends on breaks (`INTERCEPT.md` §3, "the population trap").
+ *
+ * `flags` is supplied by the caller because `outOfNetwork` needs relationship
+ * context a bare status does not carry — see {@link ForYouImpressionFlags}.
+ */
+export function recordForYouImpression(status: mastodon.v1.Status | undefined, flags: ForYouImpressionFlags) {
+  if (!import.meta.client || !status)
+    return
+  const signals = useForYouSignals().value
+  recordForYouImpressionInSignals(
+    signals,
+    { id: status.reblog?.id ?? status.id, ...flags },
+    impressedIndex.get(signals),
+  )
 }
 
 /** Explicit dismissal of a single post. */
@@ -1273,7 +1675,7 @@ export function markNotInterested(status: mastodon.v1.Status | undefined) {
   const signals = useForYouSignals().value
   const target = getEngagementTarget(status)
   applyNotInterestedToSignals(signals, target.statusId ?? status.id, target)
-  invalidateSeenIndex()
+  seenIndex.invalidate()
 }
 
 /**
@@ -1290,11 +1692,18 @@ export function forgetNotInterested(statusId: string) {
   forgetNotInterestedToSignals(useForYouSignals().value, statusId)
 }
 
-/** Hides an author from this feed only, without muting them account-wide. */
-export function muteAuthorForYou(accountId: string) {
+/**
+ * Hides an author from this feed only, without muting them account-wide.
+ *
+ * `statusId`, when given, gates the `mute` counter's population match — see
+ * {@link applyMuteToSignals}'s docblock for why this function has two other
+ * call sites (`relationship.ts`'s account-wide mute/block) that must never
+ * pass one.
+ */
+export function muteAuthorForYou(accountId: string, statusId?: string) {
   if (!import.meta.client || !accountId)
     return
-  applyMuteToSignals(useForYouSignals().value, accountId)
+  applyMuteToSignals(useForYouSignals().value, accountId, undefined, statusId)
 }
 
 /**

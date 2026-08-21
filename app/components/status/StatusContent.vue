@@ -63,6 +63,7 @@ const allowEmbeddedMedia = computed(() => status.card?.html && embeddedMediaPref
       <StatusPreviewCard
         v-if="status.card && !allowEmbeddedMedia && !isNested"
         :card="status.card"
+        :status="status"
         :small-picture-only="status.mediaAttachments?.length > 0"
       />
       <StatusEmbeddedMedia v-if="allowEmbeddedMedia" :status="status" />

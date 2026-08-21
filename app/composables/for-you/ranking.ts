@@ -99,6 +99,53 @@ export const X_WEIGHTS: Record<keyof ActionProbabilities, number> = {
 }
 
 /**
+ * What the ranker actually resolves. {@link X_WEIGHTS} stays above, unchanged,
+ * as the documented reference this was derived from.
+ *
+ * **These are judgment, not measurement.** Everything else recalibrated in this
+ * file — the saturation points, the boost base rate, the federation coverage,
+ * the bot and link-card lifts — is a number measured off the live fediverse
+ * and reproducible with `scripts/for-you-calibrate.ts`. Nothing measures what a
+ * favourite is *worth* relative to a boost; that is a product decision, and X's
+ * table is a considered answer to it from a platform with real training data.
+ * So the deltas here are deliberately few, and heads with no argument against
+ * them keep X's value even where it looks surprising.
+ *
+ * Two changes:
+ *
+ * - `quote` 5.0 → 1.0. Closer to a bug fix than a judgment call. The head is
+ *   derived as `retweet * 0.12`, so at weight 5.0 it contributes `0.12 x 5.0 =
+ *   0.60` per unit of P(boost) against the real boost head's 1.0 — a 60%
+ *   surcharge on every boost prediction, for an action most fediverse software
+ *   cannot perform at all.
+ * - `share` 2.0 → 0.5. X's 2.0 is the small half of its sharing story:
+ *   `share_via_dm` (5.0) and `share_via_copy_link` (20.0) carry the rest, and
+ *   `ActionProbabilities` folds all three into this one head. Mastodon has no
+ *   quote-DM and no first-class share surface, so the folded head is worth
+ *   much less than the sum it stands in for.
+ *
+ * Left alone on purpose:
+ *
+ * - `retweet` stays 1.0. Boosting being Mastodon's only distribution mechanism
+ *   is a real argument for valuing it more, but {@link BASE_RATES} already
+ *   raises boost's contribution 3x on measured grounds. Moving the weight too
+ *   would compound to ~4.5x, and the second factor would be resting on nothing.
+ * - `BIDIRECTIONAL_FOLLOW_REPLY_WEIGHT_BOOST` stays 15.0, though it is the
+ *   most suspect number in the system here: it makes the effective mutual
+ *   reply weight 20.0, the largest weight anywhere in the ranker, on a platform
+ *   whose follow graph already has its own tab. The hypothesis is that it
+ *   collapses For You into Following-with-extra-steps — but it *is* a
+ *   hypothesis, and `scripts/for-you-replay.ts` can test it against a real
+ *   candidate pool. Changing it blind is how this file got its X-scale
+ *   constants in the first place.
+ */
+export const MASTODON_WEIGHTS: Record<keyof ActionProbabilities, number> = {
+  ...X_WEIGHTS,
+  quote: 1.0,
+  share: 0.5,
+}
+
+/**
  * X's own sums, over its *full* head table (`ScoringWeights::from_params`,
  * ranking_scorer.rs:105-128 — which includes `share_via_dm` 5.0,
  * `share_via_copy_link` 20.0, `quoted_click` 0.05, `quoted_vqv` 0.0 and
@@ -106,9 +153,21 @@ export const X_WEIGHTS: Record<keyof ActionProbabilities, number> = {
  *
  *   positive_sum 43.32 · negative_sum 367.22 · total_sum 410.54
  *
- * {@link weightSums} computes the same three numbers over *our* reduced head
- * table, which necessarily gives different values (18.25 / 367.22 / 385.47).
- * They are recorded here so nobody mistakes ours for X's.
+ * Two reductions of that stand between it and what we actually score with, and
+ * they are easy to conflate:
+ *
+ *   {@link X_WEIGHTS} over our 18 heads      18.25 / 367.22 / 385.47
+ *   {@link MASTODON_WEIGHTS}, what we score  12.75 / 367.22 / 379.97
+ *
+ * The first is X's table with the heads we do not model dropped; the second
+ * additionally applies our two deliberate weight changes (`quote` 5.0 → 1.0,
+ * `share` 2.0 → 0.5), and is the only one {@link weightSums} ever sees — it is
+ * called with {@link resolveWeights}, which returns `MASTODON_WEIGHTS`. The
+ * middle row is kept because it isolates "which heads" from "which weights";
+ * do not read it as ours. {@link X_WEIGHT_SUMS} below is neither.
+ *
+ * `tests/unit/for-you-ranking.test.ts` pins all three, so changing a weight
+ * without updating this block fails rather than quietly making it a lie.
  */
 export const X_WEIGHT_SUMS = { positiveSum: 43.32, negativeSum: 367.22, totalSum: 410.54 } as const
 
@@ -181,6 +240,78 @@ export interface RankingParams {
   recencyFloor: number
   /** Multiplier for a post in a language the viewer neither reads nor engages with. */
   languageMismatchPrior: number
+
+  // Calibration constants. Elk-specific: X has no analogue because Phoenix
+  // learns the shape of its own feature distributions from training data. Ours
+  // are measured against the live fediverse — see `CALIBRATION.md` for the
+  // samples, the percentiles, and the reasoning from each number to each
+  // default. They live in params rather than at module scope so the replay
+  // harness (`scripts/for-you-replay.ts`) can sweep them.
+
+  /** {@link logNorm} saturation for the engagement composite. */
+  engagementSaturation: number
+  /** {@link logNorm} saturation for engagement per hour. */
+  velocitySaturation: number
+  /** {@link logNorm} saturation for the raw reply count. */
+  replySaturation: number
+  /** {@link logNorm} saturation for author follower count. */
+  followerSaturation: number
+  /** {@link logNorm} saturation for author status count. */
+  authorVolumeSaturation: number
+  /**
+   * How much of a *remote* post's true favourite / boost / reply count this
+   * instance can actually see, `0..1`. Local posts are authoritative and use
+   * 1.0 implicitly; remote counts are divided by these to put both on the same
+   * scale.
+   *
+   * Measured by fetching the same post from its home instance and from an
+   * observing instance (n=186, 6 observers): favourites arrive at 0.60 of
+   * their true value, boosts at 0.93, replies at 1.00. Favourites federate
+   * only to the author's and the favouriter's instances; a boost is itself a
+   * delivery event, so it propagates with the post.
+   *
+   * **This corrects the scale, not the post.** As the note in
+   * {@link extractRankingFeatures} says, dividing zero by 0.6 is still zero,
+   * and 10% of remote posts report zero favourites when the home instance has
+   * some. The correction makes a remote post with *some* visible engagement
+   * comparable to a local one; it cannot manufacture signal that never
+   * federated.
+   */
+  favouriteCoverageRemote: number
+  reblogCoverageRemote: number
+  replyCoverageRemote: number
+
+  /**
+   * Content priors: measured, reach-controlled, within-instance multipliers on
+   * how much engagement a post of this shape attracts. Applied to the positive
+   * heads and faded out as observed engagement grows — see the note in
+   * `predictActions`. 1.0 disables one.
+   */
+  botEngagementPrior: number
+  /**
+   * The bot discount on `followAuthor`, kept separate from
+   * {@link RankingParams.botEngagementPrior} because it must **not** fade as
+   * the post gets popular. The engagement priors fade on the reasoning that
+   * observed counts already embody how much the crowd engaged, so a prior
+   * about engagement is redundant where the evidence is visible. Following an
+   * author is not that quantity: it is a judgment about the account, and a
+   * viral bot post is still a bot you would not follow. Same measured
+   * magnitude, different fade behaviour — hence its own parameter, sweepable
+   * to 1.0 to disable.
+   */
+  botFollowPrior: number
+  linkEngagementPrior: number
+  mediaEngagementPrior: number
+  hashtagEngagementPrior: number
+
+  /**
+   * Added to the `reply` weight for an original post by a mutual follow.
+   * Defaults to X's {@link BIDIRECTIONAL_FOLLOW_REPLY_WEIGHT_BOOST} (15.0),
+   * which makes the effective mutual reply weight 20.0 — the largest weight
+   * anywhere in the ranker. In params so `scripts/for-you-replay.ts` can
+   * measure what it actually does before anyone argues about it.
+   */
+  bidirectionalFollowReplyWeightBoost: number
 }
 
 export const DEFAULT_RANKING_PARAMS: RankingParams = {
@@ -213,6 +344,43 @@ export const DEFAULT_RANKING_PARAMS: RankingParams = {
   // Mild, because `status.language` is set by the posting client and is
   // frequently wrong. One mislabelled field must not annihilate a post.
   languageMismatchPrior: 0.6,
+
+  // See `CALIBRATION.md`. Measured 2026-08-17 over 4,800 mature local posts
+  // (8 instances), 2,466 remote posts as observed (5 instances), 186 paired
+  // home-vs-observed fetches, and 405 unique trending posts (15 instances).
+  // Only this one was badly wrong. At 1,000,000 the entire fediverse range
+  // occupied 0.05-0.52 of a 0-1 feature. The largest post in the sample
+  // totalled 1,343 interactions and the p99 of ordinary local posts is 68, so
+  // the naive fit would be ~2,000 — but that ceiling comes from
+  // `/trends/statuses`, which is algorithmically ranked *and* moderator-gated,
+  // and no genuinely viral post from a large account was ever sampled. 10,000
+  // keeps most of the dynamic-range gain (a median trending post's engagement
+  // lift goes 3.31x -> 3.77x of its intended 8x, the top of the sample
+  // 5.7x -> 6.6x) while leaving 7x headroom above anything observed before
+  // the transform starts clipping. Sweep it with `scripts/for-you-replay.ts`.
+  engagementSaturation: 10_000,
+  // These four were already about right for the fediverse, which is worth
+  // recording: the X-scale problem was specific to total engagement.
+  // Measured maxima: 155.5 interactions/hour, 44 replies, and author
+  // followers/statuses whose p95 sits well inside these points.
+  velocitySaturation: 500,
+  replySaturation: 100,
+  followerSaturation: 50_000,
+  authorVolumeSaturation: 50_000,
+  favouriteCoverageRemote: 0.6,
+  reblogCoverageRemote: 0.93,
+  replyCoverageRemote: 1,
+
+  // Measured 0.16-0.43x (bot), 0.61-0.80x (link card), 1.25x (media) and
+  // 1.29x (hashtags), each reproducing within-instance. `botEngagementPrior`
+  // sits at the conservative end of its range — see the note at its use site.
+  botEngagementPrior: 0.4,
+  botFollowPrior: 0.4,
+  linkEngagementPrior: 0.7,
+  mediaEngagementPrior: 1.25,
+  hashtagEngagementPrior: 1.3,
+
+  bidirectionalFollowReplyWeightBoost: BIDIRECTIONAL_FOLLOW_REPLY_WEIGHT_BOOST,
 }
 
 // #endregion
@@ -308,10 +476,20 @@ export interface RankingContext {
   mutualAuthorIds?: ReadonlySet<string>
   /** Overrides the default affinity reading. See {@link AffinityResolver}. */
   affinity?: Partial<AffinityResolver>
-  /** Per-action weight overrides, merged over {@link X_WEIGHTS}. */
+  /** Per-action weight overrides, merged over {@link MASTODON_WEIGHTS}. */
   weights?: Partial<Record<keyof ActionProbabilities, number>>
   /** Parameter overrides, merged over {@link DEFAULT_RANKING_PARAMS}. */
   params?: Partial<RankingParams>
+  /**
+   * Per-head base rate overrides, merged over {@link BASE_RATES}.
+   *
+   * This is how measured rates reach the model: `base-rates.ts` estimates
+   * P(action | shown in For You) from the viewer's own lifetime counters and
+   * shrinks it toward the shipped constant, and `feed.ts` passes the result
+   * through here. Absent (the default, and the cold path) the ranker reads
+   * {@link BASE_RATES} exactly as it always has. See `INTERCEPT.md` §5.
+   */
+  baseRates?: Partial<Record<keyof ActionProbabilities, number>>
 }
 
 function resolveParams(ctx: RankingContext): RankingParams {
@@ -319,8 +497,13 @@ function resolveParams(ctx: RankingContext): RankingParams {
 }
 
 function resolveWeights(ctx: RankingContext): Record<keyof ActionProbabilities, number> {
-  return ctx.weights ? { ...X_WEIGHTS, ...ctx.weights } : X_WEIGHTS
+  return ctx.weights ? { ...MASTODON_WEIGHTS, ...ctx.weights } : MASTODON_WEIGHTS
 }
+
+// `resolveBaseRates` belongs in this cluster and is deliberately not here:
+// `BASE_RATES` is not declared until the model region below, and
+// `ts/no-use-before-define` rejects the forward reference even though it is
+// runtime-safe. It sits immediately above `predictActions` instead.
 
 // #endregion
 
@@ -337,6 +520,21 @@ function clamp01(value: number): number {
 }
 
 /**
+ * Scales one federated count back up by how much of it actually reaches an
+ * observing instance. Local counts are authoritative and never come here.
+ *
+ * The guard is not defensive padding: `scripts/for-you-calibrate.ts` sweeps
+ * these coverages, and `--set favouriteCoverageRemote=0` is a reachable
+ * input. Dividing by it yields `Infinity`, which `logNorm` clamps to
+ * popularity 1.0 for *every* remote post at once — the ranking collapses
+ * silently rather than failing. A non-positive coverage means "no measurement
+ * for this count", so the honest degradation is the raw count.
+ */
+function coverageCorrected(count: number, coverage: number): number {
+  return coverage > 0 ? count / coverage : count
+}
+
+/**
  * Heavy-tail normalizer. Engagement counts on any social network are
  * power-law distributed: the difference between 0 and 10 favourites says far
  * more about a post than the difference between 1000 and 1010. `log1p`
@@ -347,7 +545,7 @@ function clamp01(value: number): number {
  * corpus and the transform stops being a normalizer and becomes a constant:
  * everything interesting clips to 1.0 and engagement drops out of the ordering
  * entirely. It must sit at the top of the realistic range, not the middle —
- * see {@link ENGAGEMENT_SATURATION}.
+ * see `RankingParams.engagementSaturation` and `CALIBRATION.md`.
  */
 export function logNorm(count: number, saturation: number): number {
   if (!(count > 0) || !(saturation > 0))
@@ -475,21 +673,30 @@ export function recencyMultiplier(ageMs: number, params: RankingParams = DEFAULT
 }
 
 /**
- * Saturation points for {@link logNorm}.
+ * Below this age we stop dividing by age, so a 1-minute-old post isn't
+ * infinitely fast.
  *
- * `ENGAGEMENT_SATURATION` sits at the very top of the fediverse range on
- * purpose. A post is only "maximally engaging" at ~1M interactions, so the
- * transform keeps discriminating across four orders of magnitude:
- * 3 → 0.10, 30 → 0.25, 300 → 0.41, 3k → 0.58, 30k → 0.75, 300k → 0.91.
- * Setting it to a few hundred, as a previous revision did, made every post on
- * a busy instance clip to 1.0 and removed engagement from the ordering.
+ * The {@link logNorm} saturation points that used to live here are now
+ * `engagementSaturation` / `velocitySaturation` / `replySaturation` /
+ * `followerSaturation` / `authorVolumeSaturation` on {@link RankingParams},
+ * so the replay harness can sweep them. Their previous values assumed X-scale
+ * engagement — `ENGAGEMENT_SATURATION` was 1,000,000, on the theory that a
+ * post is only "maximally engaging" at ~1M interactions.
+ *
+ * Measured against the live fediverse, that is off by three orders of
+ * magnitude: the single most-engaged post in a 15-instance trending sweep
+ * totalled 1,343 interactions, and the p99 of ordinary local posts is 68. The
+ * effect was that the entire fediverse range occupied 0.05–0.52 of a feature
+ * meant to span 0–1, so `lift(engagementSignal, 8)` delivered 3.31x of its
+ * intended 8x for a median trending post.
+ *
+ * The guard that motivated the old value is still real and still respected:
+ * a saturation of a few hundred would make every post on a busy instance clip
+ * to 1.0 and remove engagement from the ordering. The current defaults are
+ * chosen so the measured maximum approaches but never reaches 1.0. See
+ * `CALIBRATION.md`, including why `engagementSaturation` is the least certain
+ * of them.
  */
-const ENGAGEMENT_SATURATION = 1_000_000
-const VELOCITY_SATURATION = 500
-const REPLY_SATURATION = 100
-const FOLLOWER_SATURATION = 50_000
-const AUTHOR_VOLUME_SATURATION = 50_000
-/** Below this age we stop dividing by age, so a 1-minute-old post isn't infinitely fast. */
 const MIN_VELOCITY_AGE_HOURS = 0.25
 
 /** Everything the estimators read, computed once per candidate. */
@@ -501,7 +708,15 @@ export interface RankingFeatures {
   favourites: number
   reblogs: number
   replies: number
+  /** Raw observed sum, exactly as the instance reported it. */
   totalEngagement: number
+  /**
+   * `totalEngagement` with each count divided by how much of it federates, so
+   * a remote post is on the same scale as a local one. Equal to
+   * `totalEngagement` for local posts. This is what `popularity` and
+   * `velocity` are computed from.
+   */
+  engagementEstimate: number
   /** 0..1 absolute reach of the post. */
   popularity: number
   /** 0..1 engagement per hour — lets a fresh post compete with an old hit. */
@@ -515,6 +730,8 @@ export interface RankingFeatures {
   /** Signed, -1..1, from the viewer's positive engagement history. */
   authorAffinity: number
   tagAffinity: number
+  /** How many hashtags the post carries. Presence is a measured engagement prior. */
+  tagCount: number
   languageAffinity: number
   /** Signed affinity for whoever boosted this, 0 when it is not a boost. */
   boosterAffinity: number
@@ -603,31 +820,67 @@ export function extractRankingFeatures(
   const ageHours = ageMs / 3_600_000
   const freshness = recencyMultiplier(ageMs, params)
 
-  // Counts are used exactly as the instance reports them. A previous revision
-  // multiplied remote posts' counts by a constant to "correct" for federation
-  // under-counting; that was the wrong functional form. The error is additive
-  // and its size is anti-correlated with the constant's effect: on a
-  // single-user instance a remote post's counts are 0 or 1, and 3 x 0 is still
-  // 0, while on a large instance the counts are near-complete and the
-  // multiplier only injects bias. Correcting this properly needs a per-instance
-  // estimate of federation coverage that the API does not expose, so we do
-  // nothing and record the bias as a known weakness instead of papering over it.
+  // A previous revision multiplied remote posts' counts by a single constant
+  // to "correct" for federation under-counting, and a later one removed that
+  // on the grounds that the API exposes no per-instance coverage estimate.
+  //
+  // The removal reasoning was half right, and the half that was right still
+  // holds: on a single-user instance a remote post's counts are 0 or 1, and
+  // 3 x 0 is still 0. No multiplier recovers a favourite that never arrived.
+  // What was wrong is the premise that coverage is unmeasurable. It is — fetch
+  // the same post from its home instance and compare — and it is not one
+  // number but three very different ones, because the three counts federate by
+  // different mechanisms. That measurement is what `*CoverageRemote` encodes
+  // and what the composite below applies. See `CALIBRATION.md`.
   const favourites = status.favouritesCount ?? 0
   const reblogs = status.reblogsCount ?? 0
   const replies = status.repliesCount ?? 0
   const totalEngagement = favourites + reblogs + replies
 
-  const popularity = logNorm(totalEngagement, ENGAGEMENT_SATURATION)
+  // The three counts do not federate equally, so summing them as if they were
+  // one number lets whichever happened to arrive dominate. Measured by
+  // re-fetching the same post from its home instance (n=186): favourites reach
+  // an observing instance at 0.60 of their true value, boosts at 0.93, replies
+  // at 1.00. On a federated timeline the practical effect is stark — 96% of
+  // remote posts report *zero* favourites, and boosts outnumber favourites
+  // 1.755:1, the exact inverse of the 1:0.465 measured on authoritative local
+  // posts.
+  //
+  // Left uncorrected this does two things: it makes the composite a lottery on
+  // federation topology, and it puts remote posts on a systematically deflated
+  // scale versus local ones — which the 0.75 out-of-network factor then
+  // discounts *again*. So remote counts are divided by their measured coverage
+  // and local counts are used as-is.
+  //
+  // `totalEngagement` stays the raw observed sum: it is what the instance
+  // actually reported, it is what the densities below are shares of, and
+  // `impressionProxy` needs the honest number.
+  const remote = (account?.acct ?? '').includes('@')
+  const correctedFavourites = remote ? coverageCorrected(favourites, params.favouriteCoverageRemote) : favourites
+  const correctedReblogs = remote ? coverageCorrected(reblogs, params.reblogCoverageRemote) : reblogs
+  const correctedReplies = remote ? coverageCorrected(replies, params.replyCoverageRemote) : replies
+  const engagementEstimate = correctedFavourites + correctedReblogs + correctedReplies
+
+  const popularity = logNorm(engagementEstimate, params.engagementSaturation)
   const velocity = logNorm(
-    totalEngagement / Math.max(MIN_VELOCITY_AGE_HOURS, Math.min(ageHours, 48)),
-    VELOCITY_SATURATION,
+    engagementEstimate / Math.max(MIN_VELOCITY_AGE_HOURS, Math.min(ageHours, 48)),
+    params.velocitySaturation,
   )
   // Half absolute reach, half rate. Rate alone would hand the feed to
   // five-minute-old posts with two favourites; reach alone would hand it to
   // last week's viral post.
   const engagementSignal = 0.5 * popularity + 0.5 * velocity
-  const replyDensity = totalEngagement > 0 ? replies / totalEngagement : 0
-  const reblogDensity = totalEngagement > 0 ? reblogs / totalEngagement : 0
+  // Densities are shares of the *corrected* composite, not of the raw sum.
+  // The three counts federate unequally, so a raw share hands the ratio to
+  // whichever count happened to arrive: with favourites at 0.60 coverage and
+  // replies at 1.00, an ordinary remote post reads as far more reply-heavy
+  // than it is, and `lift(f.replyDensity, 2.5)` then multiplies that artifact
+  // straight into `reply`. The sharpest case is the common one — 96% of
+  // remote posts report zero favourites, so equal observed boosts and replies
+  // read 50/50 when the true post is boost-heavy, boosts having federated at
+  // 0.93 against replies' 1.00. See `CALIBRATION.md`.
+  const replyDensity = engagementEstimate > 0 ? correctedReplies / engagementEstimate : 0
+  const reblogDensity = engagementEstimate > 0 ? correctedReblogs / engagementEstimate : 0
 
   const authorAffinity = account?.id ? affinity.author(account.id) : 0
   const authorPenalty = clamp01(affinity.authorPenalty(account?.id ?? ''))
@@ -655,7 +908,7 @@ export function extractRankingFeatures(
 
   const followers = account?.followersCount ?? 0
   const following = account?.followingCount ?? 0
-  const authorReach = logNorm(followers, FOLLOWER_SATURATION)
+  const authorReach = logNorm(followers, params.followerSaturation)
   // Classic follow-spam shape: follows many, followed by few. Only meaningful
   // once the account follows a non-trivial number of people.
   const followRatio = following > 20 ? followers / following : 1
@@ -664,7 +917,7 @@ export function extractRankingFeatures(
     + (account?.note ? 0 : 0.15)
     + (account?.statusesCount === 0 ? 0.1 : 0),
   )
-  const authorVolume = logNorm(account?.statusesCount ?? 0, AUTHOR_VOLUME_SATURATION)
+  const authorVolume = logNorm(account?.statusesCount ?? 0, params.authorVolumeSaturation)
   const verified = (account?.fields ?? []).some(field => !!field.verifiedAt)
 
   const media = status.mediaAttachments ?? []
@@ -679,6 +932,7 @@ export function extractRankingFeatures(
     reblogs,
     replies,
     totalEngagement,
+    engagementEstimate,
     popularity,
     velocity,
     engagementSignal,
@@ -686,6 +940,7 @@ export function extractRankingFeatures(
     reblogDensity,
     authorAffinity,
     tagAffinity,
+    tagCount: (status.tags ?? []).length,
     languageAffinity,
     boosterAffinity,
     authorPenalty,
@@ -736,8 +991,28 @@ export function extractRankingFeatures(
  */
 export const BASE_RATES: Record<keyof ActionProbabilities, number> = {
   favorite: 0.03,
-  reply: 0.003,
-  retweet: 0.006,
+  reply: 0.0035,
+  // 3x X's rate. On X a retweet is roughly a fifth as common as a favourite;
+  // on Mastodon boosting is the only way a post travels, so it runs much
+  // closer to parity. The three estimates of boost/favourite disagree, and the
+  // spread is itself informative:
+  //
+  //   0.465  authoritative local posts (n=4,800) — the true ratio
+  //   0.721  implied by per-count federation coverage (0.465 x 0.93/0.60)
+  //   1.755  federated timelines as observed (n=2,466)
+  //
+  // The For You pool mixes local and remote sources, so the effective value
+  // sits between the first two; 0.6 x the favourite rate is the midpoint.
+  // (The third is inflated by the federated firehose's different population,
+  // not by coverage alone, so it is not a candidate.)
+  //
+  // Note this is a directional transfer, not a literal one: `BASE_RATES` is
+  // P(*this viewer* acts | impression), while what was measured is aggregate
+  // counts per post — and boosts inflate their own impression denominator,
+  // since a boost is what generates the impressions. See `CALIBRATION.md`.
+  retweet: 0.018,
+  // Unused: the `quote` head is derived from `retweet` below rather than from
+  // a base rate. Kept at its X value so the head table stays complete.
   quote: 0.0006,
   share: 0.001,
   click: 0.03,
@@ -753,6 +1028,16 @@ export const BASE_RATES: Record<keyof ActionProbabilities, number> = {
   blockAuthor: 0.000015,
   report: 0.000003,
   notDwelled: 0.22,
+}
+
+/**
+ * Merges `ctx.baseRates` over {@link BASE_RATES}, the same shape
+ * {@link resolveParams} and {@link resolveWeights} use. Returns the module
+ * constant itself when nothing is overridden, so the cold path allocates
+ * nothing and stays byte-identical to the pre-measurement ranker.
+ */
+function resolveBaseRates(ctx: RankingContext): Record<keyof ActionProbabilities, number> {
+  return ctx.baseRates ? { ...BASE_RATES, ...ctx.baseRates } : BASE_RATES
 }
 
 /**
@@ -778,8 +1063,70 @@ export function predictActions(
   signals: ForYouSignals,
   ctx: RankingContext,
 ): ActionProbabilities {
-  const f = extractRankingFeatures(candidate, signals, ctx)
-  const B = BASE_RATES
+  return predictActionsFrom(candidate, extractRankingFeatures(candidate, signals, ctx), ctx)
+}
+
+/**
+ * {@link predictActions} over features the caller already has.
+ *
+ * The split exists because {@link scoreCandidate} needs the same
+ * `RankingFeatures` for its own context multiplier, and extracting them twice
+ * per candidate per page is pure waste. `predictActions` keeps its
+ * `(candidate, signals, ctx)` shape as the module's public entry point.
+ */
+function predictActionsFrom(
+  candidate: PostCandidate,
+  f: RankingFeatures,
+  ctx: RankingContext,
+): ActionProbabilities {
+  const params = resolveParams(ctx)
+  const B = resolveBaseRates(ctx)
+
+  // ── measured content priors ─────────────────────────────────────────────
+  // Multiplicative effects measured off the live fediverse, applied to the
+  // heads that predict engagement. Each survived a *within-instance* control,
+  // which is the check that matters here: mean engagement varies 7.5x across
+  // instances and bot share ranges 0-49%, so a pooled effect that does not
+  // reproduce inside each instance separately is an artifact of which servers
+  // happened to be sampled. See `CALIBRATION.md`.
+  //
+  //   bot author  0.16-0.43x  reproduces in 6 of 7 testable instances
+  //   link card   0.61-0.80x  reproduces in 7 of 8
+  //   media 1.25x, hashtags 1.29x (humans only)
+  //
+  // Bot and link-card are two effects, not one seen twice: P(bot & card) is
+  // only 1.16x what independence predicts, and the card effect is unchanged
+  // with bots removed (0.68x -> 0.67x). Both are applied.
+  //
+  // 0.3 for bots is the midpoint of a wide credible range, not a point
+  // estimate — and it is deliberately not lower. Bots are 23% of a local
+  // public timeline but a much smaller share of a For You pool, whose
+  // candidate sources lean on the follow graph and trending.
+  // These are measurements of how much *the crowd* engaged, which means that
+  // where the crowd's engagement is already visible they are redundant — the
+  // counts embody them. Applying them at full strength on top of an observed
+  // count is the same effect twice: a post with media already has whatever
+  // extra favourites the media earned it.
+  //
+  // They earn their keep where the counts are silent, which on the fediverse
+  // is most of the time — 59% of remote posts show no engagement at all, and
+  // 36% of local ones. So they fade out as observed engagement grows, and a
+  // post with real measured traction is judged on that traction instead.
+  const priorStrength = 1 - f.popularity
+  const shrink = (prior: number) => 1 + (prior - 1) * priorStrength
+
+  // `botEngagementPrior` ships at 0.4, the conservative end of the measured
+  // 0.16-0.43 range, for two reasons: the measurement comes from local public
+  // timelines, where bots are far over-represented (0-49% by instance)
+  // compared with a For You pool that leans on the follow graph and trending;
+  // and below ~0.4 the discount gets strong enough to push a zero-engagement
+  // bot post under `NEGATIVE_SCORES_OFFSET`, into the band that means "the
+  // viewer said no". Predicted-low-engagement should rank a post last, not
+  // mark it rejected.
+  const botPrior = shrink(f.bot ? params.botEngagementPrior : 1)
+  const linkPrior = shrink(f.hasLink ? params.linkEngagementPrior : 1)
+  const mediaPrior = shrink(f.hasImage || f.hasVideo ? params.mediaEngagementPrior : 1)
+  const hashtagPrior = shrink(f.tagCount > 0 ? params.hashtagEngagementPrior : 1)
 
   // ── favorite ────────────────────────────────────────────────────────────
   // The action Mastodon's counters speak to most directly, and the one the
@@ -797,7 +1144,11 @@ export function predictActions(
     // an author you trust. Weaker than direct author affinity because the
     // booster only chose the post, they did not write it.
     * lift(f.boosterAffinity, 1.8, 0.7)
-    * (f.isBoost ? 0.9 : 1),
+    * (f.isBoost ? 0.9 : 1)
+    * botPrior
+    * linkPrior
+    * mediaPrior
+    * hashtagPrior,
   )
 
   // ── reply ───────────────────────────────────────────────────────────────
@@ -816,7 +1167,8 @@ export function predictActions(
     * lift(f.tagAffinity, 1.4, 0.8)
     * (f.hasQuestion ? 1.4 : 1)
     * (f.hasPoll ? 1.3 : 1)
-    * (f.isBoost ? 0.5 : 1),
+    * (f.isBoost ? 0.5 : 1)
+    * botPrior,
   )
 
   // ── retweet (boost) ─────────────────────────────────────────────────────
@@ -830,7 +1182,8 @@ export function predictActions(
     * lift(f.authorAffinity, 2.5, 0.5)
     * lift(f.boosterAffinity, 1.6, 0.8)
     * (f.isBoost ? 0.5 : 1)
-    * (f.isReply ? 0.6 : 1),
+    * (f.isReply ? 0.6 : 1)
+    * botPrior,
   )
 
   // ── quote ───────────────────────────────────────────────────────────────
@@ -848,7 +1201,11 @@ export function predictActions(
   const share = clamp01(
     B.share
     * lift(f.popularity, 4)
-    * (f.hasLink ? 1.6 : 1)
+    // X boosts this 1.6x for links, on the reasoning that a link is the thing
+    // people forward. On Mastodon link posts measurably under-perform —
+    // 0.61-0.80x, reach-controlled, in 7 of 8 instances — so the lift points
+    // the wrong way and becomes the same `linkPrior` the other heads use.
+    * linkPrior
     * (f.hasImage || f.hasVideo ? 1.2 : 1),
   )
 
@@ -857,7 +1214,7 @@ export function predictActions(
   // content warning (curiosity gap), or text the timeline truncated.
   const click = clamp01(
     B.click
-    * lift(logNorm(f.replies, REPLY_SATURATION), 3)
+    * lift(logNorm(f.replies, params.replySaturation), 3)
     * (f.hasSpoiler ? 1.8 : 1)
     * lift(clamp01((f.textLength - 280) / 700), 1.5)
     * lift(f.authorAffinity, 2, 0.6),
@@ -939,7 +1296,9 @@ export function predictActions(
         * lift(f.tagAffinity, 2, 0.6)
         * lift(f.authorReach, 1.5)
         * (f.verified ? 1.5 : 1)
-        * (f.bot ? 0.4 : 1)
+        // Not `botPrior`: that one fades with popularity, and this one must
+        // not. See {@link RankingParams.botFollowPrior}.
+        * (f.bot ? params.botFollowPrior : 1)
         * (f.isReply ? 0.7 : 1),
       )
 
@@ -966,7 +1325,13 @@ export function predictActions(
   const notInterested = clamp01(Math.max(
     B.notInterested
     * lift(-f.authorAffinity, 4, 0.25)
-    * (f.bot ? 1.8 : 1)
+    // No bot term here. Bot-ness is handled once, as `botPrior` on the
+    // positive heads, where it is measured (0.16-0.43x engagement). Having it
+    // *also* inflate the negative heads was the same signal counted twice on
+    // both sides at once, and it pushed an ordinary never-dismissed bot post
+    // below `NEGATIVE_SCORES_OFFSET` — into the band that is supposed to mean
+    // "the viewer said no", where ordering is compressed to nothing. Low
+    // engagement is a reason to rank a post last; it is not a rejection.
     * lift(f.spamminess, 2.5)
     * (f.sensitive ? 1.2 : 1),
     Math.max(f.postPenalty, f.authorPenalty),
@@ -989,7 +1354,8 @@ export function predictActions(
     B.muteAuthor
     * lift(-f.authorAffinity, 5, 0.2)
     * lift(f.authorVolume, 2)
-    * (f.bot ? 2 : 1)
+    // See `notInterested` above: bot-ness lives on the positive heads only.
+    // `authorVolume` already carries what muting is actually about here.
     * lift(f.spamminess, 2),
     f.authorPenalty,
   ))
@@ -1075,8 +1441,15 @@ export function predictActions(
 export function effectiveWeights(
   candidate: PostCandidate,
   ctx: RankingContext,
+  /**
+   * Features the caller already extracted, purely to avoid recomputing
+   * {@link videoDurationMs} — `RankingFeatures` already carries it. Omitting
+   * it is always safe and always gives the same answer.
+   */
+  f?: RankingFeatures,
 ): Record<keyof ActionProbabilities, number> {
   const base = resolveWeights(ctx)
+  const params = resolveParams(ctx)
   const status = contentStatus(candidate)
   const outer = candidate.status
 
@@ -1085,7 +1458,7 @@ export function effectiveWeights(
       && !outer.reblog
       && !!ctx.mutualAuthorIds?.has(status.account?.id ?? '')
 
-  const durationMs = videoDurationMs(status)
+  const durationMs = f ? f.videoDurationMs : videoDurationMs(status)
   const vqvEligible
     = durationMs !== undefined
       && durationMs > MIN_VIDEO_DURATION_MS
@@ -1096,7 +1469,7 @@ export function effectiveWeights(
 
   return {
     ...base,
-    reply: bidirectionalEligible ? base.reply + BIDIRECTIONAL_FOLLOW_REPLY_WEIGHT_BOOST : base.reply,
+    reply: bidirectionalEligible ? base.reply + params.bidirectionalFollowReplyWeightBoost : base.reply,
     dwell: bidirectionalEligible ? base.dwell + BIDIRECTIONAL_FOLLOW_DWELL_WEIGHT_BOOST : base.dwell,
     vqv: vqvEligible ? base.vqv : 0,
   }
@@ -1166,7 +1539,18 @@ export function contextMultiplier(
   signals: ForYouSignals,
   ctx: RankingContext,
 ): number {
-  const f = extractRankingFeatures(candidate, signals, ctx)
+  return contextMultiplierOf(extractRankingFeatures(candidate, signals, ctx))
+}
+
+/**
+ * {@link contextMultiplier} over features the caller already has — and the one
+ * definition of it. {@link scoreCandidate} used to inline `f.freshness *
+ * f.languagePrior` rather than call the exported function, which left two
+ * expressions for one quantity with only the test suite reading the exported
+ * one. If they ever disagreed, production would have been the one that was
+ * wrong and the tests would have kept passing.
+ */
+function contextMultiplierOf(f: RankingFeatures): number {
   return f.freshness * f.languagePrior
 }
 
@@ -1187,9 +1571,12 @@ export function scoreCandidate(
   signals: ForYouSignals,
   ctx: RankingContext,
 ): PostCandidate {
+  // Extracted once and threaded into everything below it: `predictActions`,
+  // `effectiveWeights` and the context multiplier all used to derive the same
+  // `RankingFeatures` independently, three times per candidate per page.
   const features = extractRankingFeatures(candidate, signals, ctx)
-  const probabilities = predictActions(candidate, signals, ctx)
-  const weights = effectiveWeights(candidate, ctx)
+  const probabilities = predictActionsFrom(candidate, features, ctx)
+  const weights = effectiveWeights(candidate, ctx, features)
   // Denominator from the *base* weights, once per request, as X does.
   const sums = weightSums(resolveWeights(ctx))
 
@@ -1210,7 +1597,7 @@ export function scoreCandidate(
 
   reasons.sort((a, b) => Math.abs(b.value) - Math.abs(a.value))
 
-  const context = features.freshness * features.languagePrior
+  const context = contextMultiplierOf(features)
   const net = pos - neg
   const scaled = net >= 0 ? context * net : net
 
@@ -1385,6 +1772,12 @@ export function applyNewAuthorBoost(
   const slot = lo + Math.floor(Math.random() * (hi - lo))
   const target = ranked[slot]!
 
+  // Unlike `scoreCandidate`, this recomputes `contentAgeMs`/`impressionProxy`
+  // per candidate rather than reading them off `RankingFeatures`. That is
+  // deliberate: `applyAdjustments` is handed `candidates` and `rawScore` only,
+  // so threading features here would widen its signature and `rankCandidates`'
+  // to save two arithmetic helpers that run once per slate. Not worth it.
+  //
   // positions_among_nonzero: rank only the candidates with a non-zero score.
   const order = scores
     .map((score, index) => ({ score, index }))

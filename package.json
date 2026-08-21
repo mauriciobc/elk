@@ -29,6 +29,9 @@
     "cleanup-translations": "node scripts/cleanup-translations.ts",
     "prepare-translation-status": "node scripts/prepare-translation-status.ts",
     "generate-pwa-icons": "node scripts/generate-pwa-icons.ts",
+    "for-you:calibrate": "node scripts/for-you-calibrate.ts",
+    "for-you:capture": "node scripts/for-you-capture.ts",
+    "for-you:replay": "node scripts/for-you-replay.ts",
     "postinstall": "simple-git-hooks && nuxt prepare",
     "release": "bumpp && node scripts/release.ts"
   },

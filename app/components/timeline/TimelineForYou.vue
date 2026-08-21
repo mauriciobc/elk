@@ -15,7 +15,7 @@ const isSlow = isSupported.value && !!effectiveType.value && ['slow-2g', '2g', '
  * it exactly like every other timeline — infinite scroll, the end anchor, the
  * skeleton and the virtual scroller all come for free.
  */
-const { paginator, isFallback, stale, checkStale, refresh, relevance } = useForYouFeed({
+const { paginator, isFallback, stale, checkStale, refresh, relevance, inNetwork } = useForYouFeed({
   pageSize: isSlow ? 10 : DEFAULT_FOR_YOU_PAGE_SIZE,
   sourceLimit: isSlow ? 20 : undefined,
 })
@@ -353,6 +353,7 @@ const exploreLink = computed(() => {
             :older="older"
             :newer="newer"
             :relevance="relevance.get(item.id)"
+            :in-network="inNetwork.get(item.id)"
             @dismiss="onDismiss"
           />
         </template>

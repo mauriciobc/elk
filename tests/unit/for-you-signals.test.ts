@@ -26,6 +26,7 @@ import {
   markSeenInSignals,
   MAX_DISMISSED,
   MAX_FOLLOW_SIGNALS,
+  MAX_IMPRESSED_AUTHORS,
   MAX_MUTED,
   MAX_SEEN,
   MAX_SIGNALS_PER_KIND,
@@ -34,6 +35,7 @@ import {
   MUTUAL_MULTIPLIER,
   normalizeSignals,
   NOT_INTERESTED_STRENGTH,
+  recordForYouImpressionInSignals,
   recordSignal,
   SIGNALS_VERSION,
   sortDedupTruncate,
@@ -979,5 +981,326 @@ describe('for-you signals: the shape guard compares deeply', () => {
     expect(first.changed).toBe(false)
     expect(second.changed).toBe(false)
     expect(second.signals).toEqual(first.signals)
+  })
+})
+
+// ──────────────────────────────── counters and the impression population ──
+// INTERCEPT.md §3, "the population trap" — the regression tests that matter
+// most: the numerator (`counters.actions`) and denominator
+// (`counters.impressions`/`eligible`) must cover exactly the same set of
+// posts, which is what `impressed` exists to guarantee.
+
+describe('for-you signals: counters and the impression population (the population trap)', () => {
+  it('markSeenInSignals — the masto/routes.ts style call — moves neither impressions nor impressed; the impression call does both', () => {
+    const signals = createEmptySignals()
+
+    // `masto/routes.ts:98`'s status-detail navigation goes through
+    // `markSeenInSignals` alone, exactly like this.
+    markSeenInSignals(signals, ['s1'])
+    expect(signals.seen).toEqual(['s1'])
+    expect(signals.counters.impressions).toBe(0)
+    expect(signals.counters.eligible).toEqual({ hasLink: 0, hasMedia: 0, outOfNetwork: 0 })
+    expect(signals.impressed).toEqual([])
+
+    // The For You call site records both.
+    recordForYouImpressionInSignals(signals, { id: 's2', hasLink: true, hasMedia: false, outOfNetwork: true })
+    expect(signals.counters.impressions).toBe(1)
+    expect(signals.counters.eligible).toEqual({ hasLink: 1, hasMedia: 0, outOfNetwork: 1 })
+    expect(signals.impressed).toEqual(['s2'])
+  })
+
+  it('accepts a bare status too, deriving hasLink/hasMedia the way ranking.ts\'s extractRankingFeatures does', () => {
+    const signals = createEmptySignals()
+    const withCardAndMedia = {
+      ...status('s1'),
+      card: { url: 'https://example.com' },
+      mediaAttachments: [{ type: 'image' }],
+    } as unknown as mastodon.v1.Status
+
+    recordForYouImpressionInSignals(signals, withCardAndMedia)
+
+    expect(signals.impressed).toEqual(['s1'])
+    expect(signals.counters.eligible.hasLink).toBe(1)
+    expect(signals.counters.eligible.hasMedia).toBe(1)
+    // A bare status carries no relationship context, so it is treated as
+    // in-network rather than guessed at.
+    expect(signals.counters.eligible.outOfNetwork).toBe(0)
+  })
+
+  it('eligible counters increment only for eligible impressions, and a repeated impression of the same post does not double-count', () => {
+    const signals = createEmptySignals()
+    recordForYouImpressionInSignals(signals, { id: 's1', hasLink: true, hasMedia: false, outOfNetwork: false })
+    recordForYouImpressionInSignals(signals, { id: 's2', hasLink: false, hasMedia: true, outOfNetwork: true })
+    // A rapid re-fire of the intersection latch for the same post.
+    recordForYouImpressionInSignals(signals, { id: 's1', hasLink: true, hasMedia: false, outOfNetwork: false })
+
+    expect(signals.impressed).toEqual(['s1', 's2'])
+    expect(signals.counters.impressions).toBe(2)
+    expect(signals.counters.eligible).toEqual({ hasLink: 1, hasMedia: 1, outOfNetwork: 1 })
+  })
+
+  it('an action on a status never impressed does not increment its counter, but still records the signal completely normally', () => {
+    const signals = createEmptySignals()
+    // No impression was ever recorded for 's1' — e.g. a favourite reached
+    // through notifications or search, not the For You feed.
+    recordSignal(signals, 'favourite', target({ statusId: 's1', authorId: 'a' }), NOW)
+
+    expect(signals.counters.actions.favourite).toBeUndefined()
+    // The gate only touches the counter: affinity behaviour is unchanged.
+    expect(signals.engaged.favourite!.length).toBe(1)
+    expect(signals.engaged.favourite![0]!.statusId).toBe('s1')
+    expect(signals.authorAffinity.a).toBe(ENGAGEMENT_STRENGTH.favourite)
+  })
+
+  it('increments an action counter only once the post has been impressed', () => {
+    const signals = createEmptySignals()
+    recordForYouImpressionInSignals(signals, { id: 's1', hasLink: false, hasMedia: false, outOfNetwork: false })
+    recordSignal(signals, 'favourite', target({ statusId: 's1', authorId: 'a' }), NOW)
+
+    expect(signals.counters.actions.favourite).toBe(1)
+  })
+
+  it('no entry point can move a counter for an unimpressed post — the gate is one place, so prove it once for all of them', () => {
+    // The population rule used to be re-asserted at each call site, where the
+    // sixth one could quietly forget it. It now lives in `bumpActionCounter`.
+    // This drives *every* entry point that reaches it, against a post that was
+    // never impressed, and asserts `actions` is still completely empty.
+    const signals = createEmptySignals()
+
+    recordSignal(signals, 'favourite', target({ statusId: 'ghost', authorId: 'a' }), NOW)
+    recordSignal(signals, 'reblog', target({ statusId: 'ghost', authorId: 'a' }), NOW)
+    forgetSignal(signals, 'favourite', 'ghost', NOW)
+    applyNotInterestedToSignals(signals, 'ghost', target({ statusId: 'ghost', authorId: 'a' }), NOW)
+    forgetNotInterestedToSignals(signals, 'ghost', NOW)
+    applyMuteToSignals(signals, 'a', NOW, 'ghost')
+    // The account-wide mute path, which has no post at all: also never counts.
+    applyMuteToSignals(signals, 'b', NOW)
+
+    expect(signals.counters.actions).toEqual({})
+    expect(signals.counters.impressions).toBe(0)
+  })
+
+  it('forgetSignal decrements the matching counter, gated the same way the increment was', () => {
+    const signals = createEmptySignals()
+    recordForYouImpressionInSignals(signals, { id: 's1', hasLink: false, hasMedia: false, outOfNetwork: false })
+    recordSignal(signals, 'favourite', target({ statusId: 's1', authorId: 'a' }), NOW)
+    expect(signals.counters.actions.favourite).toBe(1)
+
+    forgetSignal(signals, 'favourite', 's1', NOW)
+    expect(signals.counters.actions.favourite).toBeUndefined()
+  })
+
+  it('floors at 0 rather than going negative when a retraction is gated-in but was never gated-in on the way up', () => {
+    const signals = createEmptySignals()
+    // Favourited *before* the impression was ever recorded: the increment in
+    // `recordSignal` was correctly skipped.
+    recordSignal(signals, 'favourite', target({ statusId: 's1', authorId: 'a' }), NOW)
+    expect(signals.counters.actions.favourite).toBeUndefined()
+
+    // The post becomes impressed afterwards (e.g. it resurfaces on a later
+    // page), so `forgetSignal`'s gate now passes even though the matching
+    // increment never happened.
+    recordForYouImpressionInSignals(signals, { id: 's1', hasLink: false, hasMedia: false, outOfNetwork: false })
+    forgetSignal(signals, 'favourite', 's1', NOW)
+
+    expect(signals.counters.actions.favourite).toBeUndefined()
+  })
+
+  it('forgetNotInterestedToSignals decrements the dismiss counter, gated and floored the same way', () => {
+    const signals = createEmptySignals()
+    recordForYouImpressionInSignals(signals, { id: 's1', hasLink: false, hasMedia: false, outOfNetwork: false })
+    applyNotInterestedToSignals(signals, 's1', target({ statusId: 's1', authorId: 'a' }), NOW)
+    expect(signals.counters.actions.dismiss).toBe(1)
+
+    forgetNotInterestedToSignals(signals, 's1', NOW)
+    expect(signals.counters.actions.dismiss).toBeUndefined()
+
+    // Undoing again is a no-op, not a negative counter.
+    forgetNotInterestedToSignals(signals, 's1', NOW)
+    expect(signals.counters.actions.dismiss).toBeUndefined()
+  })
+
+  it('gates the mute counter on an explicit statusId, so an account-wide mute/block (no statusId) never counts', () => {
+    const signals = createEmptySignals()
+    recordForYouImpressionInSignals(signals, { id: 's1', hasLink: false, hasMedia: false, outOfNetwork: false })
+
+    // `relationship.ts`'s `toggleMuteAccount`/`toggleBlockAccount` call
+    // `applyMuteToSignals` with no `statusId` — reachable from any surface,
+    // nothing to do with this feed.
+    applyMuteToSignals(signals, 'account-a', NOW)
+    expect(signals.counters.actions.mute).toBeUndefined()
+
+    // `TimelineForYouItem.vue`'s "show less from author" passes the post's
+    // own key, which is impressed.
+    applyMuteToSignals(signals, 'account-b', NOW, 's1')
+    expect(signals.counters.actions.mute).toBe(1)
+  })
+
+  // ── followAuthor: the one head attributed by author, not by post ──────────
+  //
+  // `recordFollow` mints a synthetic `follow:<accountId>` key that can never
+  // appear in `impressed`, so the post gate rejects every follow and pinned
+  // `actions.follow` at zero forever. The gate for this kind asks the only
+  // question a follow can answer: was this *author* put on screen, out of
+  // network, by For You.
+
+  it('counts a follow of an author seen out-of-network in For You', () => {
+    const signals = createEmptySignals()
+    recordForYouImpressionInSignals(signals, {
+      id: 's1',
+      hasLink: false,
+      hasMedia: false,
+      outOfNetwork: true,
+      authorId: 'stranger',
+    })
+    expect(signals.impressedAuthors).toEqual(['stranger'])
+
+    // Exactly what `recordFollow` builds.
+    recordSignal(signals, 'follow', target({ statusId: 'follow:stranger', authorId: 'stranger' }), NOW)
+    expect(signals.counters.actions.follow).toBe(1)
+    expect(signals.counters.eligible.outOfNetwork).toBe(1)
+  })
+
+  it('does not count a follow of an author never seen out-of-network here', () => {
+    const signals = createEmptySignals()
+    // Seen, but in-network: `followAuthor` is gated on `!inNetwork` in the
+    // ranker, so this impression was never eligible for the head.
+    recordForYouImpressionInSignals(signals, {
+      id: 's1',
+      hasLink: false,
+      hasMedia: false,
+      outOfNetwork: false,
+      authorId: 'friend',
+    })
+    expect(signals.impressedAuthors).toEqual([])
+
+    recordSignal(signals, 'follow', target({ statusId: 'follow:friend', authorId: 'friend' }), NOW)
+    expect(signals.counters.actions.follow).toBeUndefined()
+    // The signal and its affinity are recorded regardless, as for every kind.
+    expect(signals.engaged.follow!.length).toBe(1)
+  })
+
+  it('does not count a follow reached from anywhere else in the app', () => {
+    const signals = createEmptySignals()
+    // A profile page, a hover card, a search result: no For You impression of
+    // this author at all.
+    recordSignal(signals, 'follow', target({ statusId: 'follow:nobody', authorId: 'nobody' }), NOW)
+    expect(signals.counters.actions.follow).toBeUndefined()
+  })
+
+  it('decrements symmetrically on an un-follow, keyed by the synthetic id', () => {
+    const signals = createEmptySignals()
+    recordForYouImpressionInSignals(signals, {
+      id: 's1',
+      hasLink: false,
+      hasMedia: false,
+      outOfNetwork: true,
+      authorId: 'stranger',
+    })
+    recordSignal(signals, 'follow', target({ statusId: 'follow:stranger', authorId: 'stranger' }), NOW)
+    expect(signals.counters.actions.follow).toBe(1)
+
+    // `forgetFollow` passes only the synthetic id; the author it was recorded
+    // against has to be recovered from the signal being removed.
+    forgetSignal(signals, 'follow', 'follow:stranger', NOW)
+    expect(signals.counters.actions.follow).toBeUndefined()
+  })
+
+  it('keeps impressedAuthors as a recency list, capped and deduped', () => {
+    const signals = createEmptySignals()
+    const seeAuthor = (id: string, author: string) => recordForYouImpressionInSignals(signals, {
+      id,
+      hasLink: false,
+      hasMedia: false,
+      outOfNetwork: true,
+      authorId: author,
+    })
+
+    seeAuthor('p1', 'a')
+    seeAuthor('p2', 'b')
+    // A *different* post by an author already seen refreshes their position
+    // rather than adding a second entry.
+    seeAuthor('p3', 'a')
+    expect(signals.impressedAuthors).toEqual(['b', 'a'])
+    // Every impression still counts toward the denominator, deduped by post.
+    expect(signals.counters.eligible.outOfNetwork).toBe(3)
+
+    for (let i = 0; i < MAX_IMPRESSED_AUTHORS; i++)
+      seeAuthor(`fill-${i}`, `author-${i}`)
+    expect(signals.impressedAuthors.length).toBe(MAX_IMPRESSED_AUTHORS)
+    expect(signals.impressedAuthors.includes('b')).toBe(false)
+  })
+
+  it('impressed evicts oldest-first at MAX_SEEN, like seen — but impressions itself is a lifetime count, never evicted', () => {
+    const signals = createEmptySignals()
+    for (let i = 0; i < MAX_SEEN + 500; i++)
+      recordForYouImpressionInSignals(signals, { id: `p${i}`, hasLink: false, hasMedia: false, outOfNetwork: false })
+
+    expect(signals.impressed.length).toBe(MAX_SEEN)
+    expect(signals.impressed[0]).toBe('p500')
+    expect(signals.impressed.includes('p499')).toBe(false)
+    expect(signals.counters.impressions).toBe(MAX_SEEN + 500)
+  })
+
+  it('keeps a caller-supplied index in sync incrementally, evictions included, mirroring markSeenInSignals', () => {
+    const signals = createEmptySignals()
+    const index = new Set<string>()
+
+    recordForYouImpressionInSignals(signals, { id: 'a', hasLink: false, hasMedia: false, outOfNetwork: false }, index)
+    recordForYouImpressionInSignals(signals, { id: 'b', hasLink: false, hasMedia: false, outOfNetwork: false }, index)
+    expect(index).toEqual(new Set(['a', 'b']))
+
+    // Re-impressing is a no-op through the supplied index too.
+    recordForYouImpressionInSignals(signals, { id: 'a', hasLink: false, hasMedia: false, outOfNetwork: false }, index)
+    expect(signals.impressed).toEqual(['a', 'b'])
+    expect(signals.counters.impressions).toBe(2)
+  })
+
+  it('counters and impressed survive a SIGNALS_VERSION bump; affinity maps still do not', () => {
+    const stored = createEmptySignals()
+    recordForYouImpressionInSignals(stored, { id: 's1', hasLink: true, hasMedia: false, outOfNetwork: true })
+    recordSignal(stored, 'favourite', target({ statusId: 's1', authorId: 'a' }), NOW)
+    expect(stored.counters.actions.favourite).toBe(1)
+    expect(stored.authorAffinity.a).toBe(ENGAGEMENT_STRENGTH.favourite)
+
+    // A blob written by an older version of the store.
+    const raw = { ...JSON.parse(JSON.stringify(stored)), version: 1 }
+    const { signals, changed } = normalizeSignals(raw)
+
+    expect(changed).toBe(true)
+    expect(signals.version).toBe(SIGNALS_VERSION)
+    // Raw observations: kept.
+    expect(signals.counters).toEqual(stored.counters)
+    expect(signals.impressed).toEqual(stored.impressed)
+    // Derived affinity maps: dropped, same as any other stale-version read.
+    expect(signals.authorAffinity).toEqual({})
+  })
+
+  it('normalizeCounters coerces non-finite/negative values to 0 and drops unknown action keys', () => {
+    const { signals } = normalizeSignals({
+      version: SIGNALS_VERSION,
+      counters: {
+        impressions: -5,
+        eligible: { hasLink: Number.NaN, hasMedia: 3, outOfNetwork: -1 },
+        actions: { favourite: 4, bogus: 9, dismiss: -2 },
+      },
+      impressed: ['s1', 's1', ''],
+    })
+
+    expect(signals.counters.impressions).toBe(0)
+    expect(signals.counters.eligible).toEqual({ hasLink: 0, hasMedia: 3, outOfNetwork: 0 })
+    expect(signals.counters.actions).toEqual({ favourite: 4 })
+    expect(signals.impressed).toEqual(['s1'])
+  })
+
+  it('defaults absent counters/impressed to zero/empty rather than throwing', () => {
+    const { signals } = normalizeSignals({ version: SIGNALS_VERSION })
+
+    expect(signals.counters).toEqual({
+      impressions: 0,
+      eligible: { hasLink: 0, hasMedia: 0, outOfNetwork: 0 },
+      actions: {},
+    })
+    expect(signals.impressed).toEqual([])
   })
 })

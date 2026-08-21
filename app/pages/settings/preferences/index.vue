@@ -133,6 +133,16 @@ function setDefaultHomeTab(tab: HomeTab) {
           </button>
         </div>
       </div>
+      <SettingsToggleItem
+        :checked="getPreferences(userSettings, 'personalizeForYouRanking')"
+        :disabled="!forYouEnabled"
+        @click="togglePreferences('personalizeForYouRanking')"
+      >
+        {{ $t('settings.preferences.personalize_for_you') }}
+        <template #description>
+          {{ $t('settings.preferences.personalize_for_you_description') }}
+        </template>
+      </SettingsToggleItem>
     </section>
     <section>
       <h2 px6 py4 mt2 font-bold text-xl flex="~ gap-1" items-center>

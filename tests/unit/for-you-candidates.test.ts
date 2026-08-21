@@ -1461,6 +1461,7 @@ describe('rate limiting', () => {
 
     const candidates = await fetchCandidates({
       client: fakeClient({ home: [status('h')] }),
+      now: NOW,
       ignoreRateLimit: true,
       disable: ['list', 'twohop', 'tag'],
       sources: ['home'],

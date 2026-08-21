@@ -1,9 +1,10 @@
 import type { mastodon } from 'masto'
 import type { InjectionKey, Ref } from 'vue'
+import type { BaseRateReport } from './base-rates'
 import type { PoolOptions, PreScoringContext } from './candidates'
 import type { DiversityRerankOptions } from './diversity'
 import type { RankingContext } from './ranking'
-import type { CandidateSource, ForYouSignals, PostCandidate } from './types'
+import type { CandidateSource, ForYouCounters, ForYouSignals, PostCandidate } from './types'
 
 /**
  * The orchestration layer of the "For You" feed.
@@ -359,8 +360,14 @@ export interface ForYouFeedOptions {
   prescoring?: PreScoringContext
   /** Overrides for the MMR rerank. */
   diversity?: DiversityRerankOptions
-  /** Ranking overrides (weights, params). */
-  ranking?: Pick<RankingContext, 'weights' | 'params'>
+  /**
+   * Ranking overrides (weights, params, base rates). An explicit `baseRates`
+   * here always wins over the measured value `buildRankingContext` computes
+   * (`INTERCEPT-BUILD.md` Step 5) — it is spread in last — which is what lets
+   * `tests/unit/for-you-ranking.test.ts` pin concrete scores regardless of
+   * this module's own measurement.
+   */
+  ranking?: Pick<RankingContext, 'weights' | 'params' | 'baseRates'>
 }
 
 /**
@@ -412,6 +419,14 @@ export interface ForYouFeed {
    * scorer's own `.reasons`.
    */
   relevance: ReadonlyMap<string, ForYouRelevanceReason>
+  /**
+   * `status.id -> whether the author is followed`, for every post emitted so
+   * far. Carried separately from {@link relevance} because the impression
+   * record's `outOfNetwork` flag — the denominator behind the `followAuthor`
+   * base rate — must read the ranker's own `PostCandidate.inNetwork`, not a
+   * string comparison against a display label that a copy change could break.
+   */
+  inNetwork: ReadonlyMap<string, boolean>
 }
 
 // ---------------------------------------------------------------------------
@@ -489,9 +504,35 @@ interface FeedSession {
    * Vue's reactivity to need to track on the map itself.
    */
   relevance: Map<string, ForYouRelevanceReason>
+  /**
+   * `status.id -> PostCandidate.inNetwork`, kept alongside {@link relevance}
+   * rather than derived from it. Same lifetime and same non-reactive `Map`.
+   */
+  inNetwork: Map<string, boolean>
 }
 
-function buildRankingContext(options: ForYouFeedOptions, signals: ForYouSignals): RankingContext {
+/**
+ * Assembles the ranker's `RankingContext` for one round.
+ *
+ * `baseRates` is passed in already resolved rather than computed here — the
+ * caller (`rankedPages`) decides *whether* the §6 preference is on and passes
+ * `undefined` when it is off, which is what makes the identity guarantee
+ * checkable at this boundary: pass `undefined` and `ctx.baseRates` is
+ * `undefined`, so `resolveBaseRates` in `ranking.ts` reads {@link BASE_RATES}
+ * by reference and scoring is byte-identical to today
+ * (`INTERCEPT-BUILD.md` Step 5, "Done when" #3/#4).
+ *
+ * `options.ranking` is spread last, so an explicit caller-supplied `baseRates`
+ * (or `weights`/`params`) always wins over the measured one. That relies on
+ * the spread skipping *absent* keys rather than clobbering with `undefined`,
+ * which is why the override is pinned by its own test below rather than left
+ * to inspection.
+ */
+export function buildRankingContext(
+  options: ForYouFeedOptions,
+  signals: ForYouSignals,
+  baseRates?: RankingContext['baseRates'],
+): RankingContext {
   const now = options.now?.() ?? Date.now()
   const account = currentUser.value?.account
   const createdAt = account?.createdAt ? Date.parse(account.createdAt) : Number.NaN
@@ -504,8 +545,45 @@ function buildRankingContext(options: ForYouFeedOptions, signals: ForYouSignals)
     viewerFollowerCount: account?.followersCount,
     viewerAccountAgeMs: Number.isNaN(createdAt) ? undefined : Math.max(0, now - createdAt),
     affinity: affinityResolver(signals, now),
+    baseRates,
     ...options.ranking,
   }
+}
+
+/**
+ * Whether the §6 preference gate is on (`INTERCEPT.md` §6) — one switch that
+ * governs Tier 1's measured base rates now and Tier 2's `α` personalization
+ * later (`TIER-2.md` §5), default off. Closed when there is no Nuxt app to
+ * read it from (unit tests) — the same guard {@link viewerLanguages} uses for
+ * `useUserSettings()` below.
+ */
+export function forYouPersonalizationEnabled(): boolean {
+  try {
+    return getPreferences(useUserSettings().value, 'personalizeForYouRanking')
+  }
+  catch {
+    return false
+  }
+}
+
+/**
+ * The measured base-rate report for this round (`base-rates.ts`,
+ * `INTERCEPT.md` §5, §6). Computed unconditionally — an identity return on
+ * the cold path, an 18-head loop otherwise, so cheap enough to pay for either
+ * way it might be needed: to feed the ranker when {@link forYouPersonalizationEnabled}
+ * is true, or to populate Step 7's dev-only debug line, which has to show `n`
+ * climbing from real impressions even while personalization itself stays
+ * off — that visibility, not whether the switch is flipped, is what the
+ * 1-week rate checkpoint (`TIER-2.md` §3) reads.
+ *
+ * `counters` lives on `ForYouSignalsStore`, not the narrower `ForYouSignals`
+ * this module is typed against — read with the same established cast
+ * {@link affinityResolver} below uses for `boosterAffinity`, rather than
+ * widening the type.
+ */
+export function resolveForYouBaseRateReport(signals: ForYouSignals): BaseRateReport {
+  const counters = (signals as { counters?: ForYouCounters }).counters
+  return measuredBaseRatesReport(counters)
 }
 
 /**
@@ -575,6 +653,66 @@ function viewerLanguages(): string[] {
 // Composable
 // ---------------------------------------------------------------------------
 
+const HTML_TAG_RE = /<[^>]*>/g
+const WHITESPACE_RE = /\s+/g
+
+/**
+ * Streams each ranked page to the dev server's terminal (`/api/for-you-debug`),
+ * so the ranking can be read from the `pnpm dev` output rather than the browser
+ * console. Dev-only, fire-and-forget, and never allowed to disturb the feed:
+ * a failed POST is swallowed, not surfaced.
+ *
+ * `baseRateReport` carries the Step 7 payload (`INTERCEPT-BUILD.md`) — shipped
+ * vs measured per head, `n`, and the `N/P` ratio — so the 1-week rate
+ * checkpoint (`TIER-2.md` §3) can be read straight from the terminal.
+ * `personalizing` is threaded separately from `baseRateReport.applied`
+ * because they answer different questions: `applied` is false both when
+ * nothing has been measured yet (cold) *and* when the §6 guardrail tripped on
+ * real data, while `personalizing` says whether the ranker is actually
+ * reading any of this at all (the preference could be off regardless of what
+ * the measurement itself looks like) — collapsing the two would hide exactly
+ * the "guardrail tripped and silently served shipped rates" case a reader
+ * most needs to see.
+ */
+function reportRankingForDev(
+  round: number,
+  page: PostCandidate[],
+  baseRateReport: BaseRateReport,
+  personalizing: boolean,
+): void {
+  if (!import.meta.dev || import.meta.test || import.meta.server)
+    return
+  void $fetch('/api/for-you-debug', {
+    method: 'POST',
+    body: {
+      round,
+      posts: page.map((candidate) => {
+        const status = candidate.status
+        const text = (status.content ?? '')
+          .replace(HTML_TAG_RE, ' ')
+          .replace(WHITESPACE_RE, ' ')
+          .trim()
+          .slice(0, 60)
+        return {
+          id: status.id,
+          acct: status.account?.acct ?? 'unknown',
+          text,
+          score: candidate.score ?? 0,
+          rawScore: candidate.rawScore ?? 0,
+          relevance: forYouRelevanceReason(candidate),
+          reasons: (candidate.reasons ?? []).slice(0, 6),
+        }
+      }),
+      baseRates: {
+        enabled: personalizing,
+        applied: baseRateReport.applied,
+        ratio: baseRateReport.ratio,
+        perHead: baseRateReport.perHead,
+      },
+    },
+  }).catch(() => {})
+}
+
 /**
  * The "For You" feed.
  *
@@ -595,6 +733,7 @@ export function useForYouFeed(options: ForYouFeedOptions = {}): ForYouFeed {
     isFallback: ref(false),
     exhausted: false,
     relevance: new Map(),
+    inNetwork: new Map(),
   }
 
   const signals = useForYouSignals()
@@ -617,6 +756,11 @@ export function useForYouFeed(options: ForYouFeedOptions = {}): ForYouFeed {
       signals: signals.value,
       limit: options.sourceLimit,
       maxTags: options.maxTags,
+      // The injected clock governs how old a *post* may be, so it has to reach
+      // the fetch side too — `drainPaginator`'s age gate would otherwise read
+      // wall-clock while the prescoring filters below read `options.now`.
+      // Undefined in production, where both fall back to `Date.now()`.
+      now: options.now?.(),
       filters: {
         // `ResultSizeFilter`: on a quiet instance, relaxing the discretionary
         // filters beats handing back half a page.
@@ -772,6 +916,12 @@ export function useForYouFeed(options: ForYouFeedOptions = {}): ForYouFeed {
       const reason = forYouRelevanceReason(candidate)
       if (reason)
         session.relevance.set(candidate.status.id, reason)
+      // Recorded as its own bit rather than recovered later from `reason`.
+      // `reason === 'following'` does mean `inNetwork` today — it is the first
+      // branch of `forYouRelevanceReason` — but that is a fact about the chip's
+      // priority order and its copy, and the impression's `outOfNetwork`
+      // denominator must not depend on either.
+      session.inNetwork.set(candidate.status.id, candidate.inNetwork)
     }
 
     if (statuses.length) {
@@ -844,10 +994,13 @@ export function useForYouFeed(options: ForYouFeedOptions = {}): ForYouFeed {
       const round = session.round++
       const candidates = await loadCandidates(round === 0)
 
+      const baseRateReport = resolveForYouBaseRateReport(signals.value)
+      const personalizing = forYouPersonalizationEnabled()
+
       const { page } = selectForYouPage(
         candidates,
         signals.value,
-        buildRankingContext(options, signals.value),
+        buildRankingContext(options, signals.value, personalizing ? baseRateReport.rates : undefined),
         {
           pageSize,
           servedKeys: session.servedKeys,
@@ -855,6 +1008,7 @@ export function useForYouFeed(options: ForYouFeedOptions = {}): ForYouFeed {
           diversity: options.diversity,
         },
       )
+      reportRankingForDev(round, page, baseRateReport, personalizing)
       const statuses = emit(page)
 
       // A first page this thin means the candidate pool itself is the problem —
@@ -923,6 +1077,7 @@ export function useForYouFeed(options: ForYouFeedOptions = {}): ForYouFeed {
     checkStale,
     refresh,
     relevance: session.relevance,
+    inNetwork: session.inNetwork,
   }
 }
 

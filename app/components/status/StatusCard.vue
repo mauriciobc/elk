@@ -56,6 +56,25 @@ function go(evt: MouseEvent | KeyboardEvent) {
   }
 }
 
+/**
+ * `profileClick` — the click family's author head (`ForYouEngagementKind`),
+ * recorded when the viewer taps through to the *author's* profile from the
+ * post: the avatar and the display name, which are the two links that lead
+ * there.
+ *
+ * Deliberately not wired on the `rebloggedBy` avatar above. That is the
+ * booster, a different account, and attributing their profile visit to this
+ * post's author would put a click in the numerator for an author the viewer
+ * never showed interest in.
+ *
+ * Fires app-wide, like every other `recordEngagement` call — `signals.ts`'s
+ * population gate is what restricts the *counter* to posts For You actually
+ * put on screen.
+ */
+function recordProfileClick() {
+  recordEngagement(status.value, 'profileClick')
+}
+
 const createdAt = useFormattedDateTime(status.value.createdAt)
 const timeAgoOptions = useTimeAgoOptions(true)
 const timeago = useTimeAgo(() => status.value.createdAt, timeAgoOptions)
@@ -174,7 +193,7 @@ const forceShow = ref(false)
             <div i-ri:repeat-fill text-green w-16px h-16px />
           </div>
           <AccountHoverWrapper :account="status.account">
-            <NuxtLink :to="getAccountRoute(status.account)" rounded-full>
+            <NuxtLink :to="getAccountRoute(status.account)" rounded-full @click="recordProfileClick">
               <AccountBigAvatar :account="status.account" />
             </NuxtLink>
           </AccountHoverWrapper>
@@ -189,7 +208,7 @@ const forceShow = ref(false)
           <!-- Account Info -->
           <div flex items-center space-x-1>
             <AccountHoverWrapper :account="status.account">
-              <StatusAccountDetails :account="status.account" />
+              <StatusAccountDetails :account="status.account" @click="recordProfileClick" />
             </AccountHoverWrapper>
             <div flex-auto />
             <div v-show="!getPreferences(userSettings, 'zenMode')" text-sm text-secondary flex="~ row nowrap" hover:underline whitespace-nowrap>

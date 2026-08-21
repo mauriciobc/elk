@@ -8,6 +8,7 @@ dist
 .env
 .DS_Store
 .idea/
+.claude/
 .vite-inspect
 .netlify/
 .eslintcache
