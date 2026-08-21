@@ -108,6 +108,20 @@ useIntersectionObserver(
       if (!seenRecorded) {
         seenRecorded = true
         markSeen([candidateKey(status)])
+        // `hasLink`/`hasMedia` mirror `ranking.ts`'s `extractRankingFeatures`
+        // (`!!status.card`, media attachments present) on the same
+        // boost-unwrapped content it scores. `outOfNetwork` cannot be read
+        // that way — a bare status carries no relationship context, and this
+        // component never receives the `PostCandidate` that has `inNetwork`
+        // — so it is read off the one thing here that is provably equivalent
+        // to it: `relevance === 'following'` iff `inNetwork` was true for
+        // this exact status (see `forYouRelevanceReason` in `feed.ts`).
+        const content = underlyingStatus(status)
+        recordForYouImpression(status, {
+          hasLink: !!content.card,
+          hasMedia: (content.mediaAttachments?.length ?? 0) > 0,
+          outOfNetwork: relevance !== 'following',
+        })
       }
       dwell.enter()
     }
@@ -202,8 +216,13 @@ provide(forYouItemInjectionKey, {
   showLessFromAuthor: () => dismiss('author', {
     apply: () => {
       const accountId = underlyingStatus(status).account?.id
+      // Passing the post's own key is what makes `mute`'s counter "count
+      // only the For You call site" (`INTERCEPT-BUILD.md`, "Attribution gaps
+      // to accept, not solve"): `relationship.ts`'s account-wide mute/block
+      // call the same `muteAuthorForYou` with no `statusId`, so only this
+      // call site's action ever clears the `impressed` gate.
       if (accountId)
-        muteAuthorForYou(accountId)
+        muteAuthorForYou(accountId, candidateKey(status))
     },
     undo: () => {
       const accountId = underlyingStatus(status).account?.id

@@ -1,4 +1,5 @@
 import type { mastodon } from 'masto'
+import type { ForYouRelevanceReason } from '../../app/composables/for-you/feed'
 import { mockComponent, mockNuxtImport, mountSuspended } from '@nuxt/test-utils/runtime'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { nextTick } from 'vue'
@@ -25,13 +26,15 @@ mockComponent('StatusCard', { template: '<div />' })
 // `mockNuxtImport`'s factory is hoisted above this file's own top-level
 // declarations (same rule as `vi.mock`), so the mocks it returns have to be
 // created through `vi.hoisted` rather than closed-over `const`s.
-const { markSeenMock, dwellEnter, dwellExit, dwellFlush } = vi.hoisted(() => ({
+const { markSeenMock, recordForYouImpressionMock, dwellEnter, dwellExit, dwellFlush } = vi.hoisted(() => ({
   markSeenMock: vi.fn(),
+  recordForYouImpressionMock: vi.fn(),
   dwellEnter: vi.fn(),
   dwellExit: vi.fn(),
   dwellFlush: vi.fn(),
 }))
 mockNuxtImport('markSeen', () => markSeenMock)
+mockNuxtImport('recordForYouImpression', () => recordForYouImpressionMock)
 mockNuxtImport('createDwellTracker', () => () => ({
   enter: dwellEnter,
   exit: dwellExit,
@@ -140,14 +143,15 @@ describe('timelineForYouItem', () => {
     window.IntersectionObserver = originalIO
     globalThis.IntersectionObserver = originalIO
     markSeenMock.mockClear()
+    recordForYouImpressionMock.mockClear()
     dwellEnter.mockClear()
     dwellExit.mockClear()
     dwellFlush.mockClear()
   })
 
-  async function mountItem() {
+  async function mountItem(props: { status?: mastodon.v1.Status, relevance?: ForYouRelevanceReason } = {}) {
     const wrapper = await mountSuspended(TimelineForYouItem, {
-      props: { status: status() },
+      props: { status: props.status ?? status(), relevance: props.relevance },
     })
     await nextTick()
     await nextTick()
@@ -171,27 +175,31 @@ describe('timelineForYouItem', () => {
     observer.emit(shortVisibleEntry())
     expect(markSeenMock).toHaveBeenCalledTimes(1)
     expect(dwellEnter).toHaveBeenCalledTimes(1)
+    // The For You impression fires alongside `markSeen`, in the same latch.
+    expect(recordForYouImpressionMock).toHaveBeenCalledTimes(1)
 
     // Rapid scroll: several more "still visible" firings must not re-record
     // seen a second time — it is a one-shot latch, not a counter.
     observer.emit(shortVisibleEntry())
     observer.emit(shortVisibleEntry())
     expect(markSeenMock).toHaveBeenCalledTimes(1)
+    expect(recordForYouImpressionMock).toHaveBeenCalledTimes(1)
     // Dwell, unlike the seen latch, does accrue every entry.
     expect(dwellEnter).toHaveBeenCalledTimes(3)
   })
 
-  it('exits dwell (without re-marking seen) once the post scrolls away', async () => {
+  it('exits dwell (without re-marking seen or re-recording the impression) once the post scrolls away', async () => {
     const { observer } = await mountItem()
 
     observer.emit(shortVisibleEntry())
     observer.emit(notIntersectingEntry())
 
     expect(markSeenMock).toHaveBeenCalledTimes(1)
+    expect(recordForYouImpressionMock).toHaveBeenCalledTimes(1)
     expect(dwellExit).toHaveBeenCalledTimes(1)
   })
 
-  it('a post taller than the viewport, which never reaches its own 0.4 ratio, still records seen and dwell', async () => {
+  it('a post taller than the viewport, which never reaches its own 0.4 ratio, still records seen, the impression, and dwell', async () => {
     const { observer } = await mountItem()
 
     const entry = tallPostFillingViewportEntry()
@@ -202,10 +210,11 @@ describe('timelineForYouItem', () => {
     observer.emit(entry)
 
     expect(markSeenMock).toHaveBeenCalledTimes(1)
+    expect(recordForYouImpressionMock).toHaveBeenCalledTimes(1)
     expect(dwellEnter).toHaveBeenCalledTimes(1)
   })
 
-  it('a sliver of a tall post peeking into view (low ratio, small viewport share) does not count as seen', async () => {
+  it('a sliver of a tall post peeking into view (low ratio, small viewport share) does not count as seen or as an impression', async () => {
     const { observer } = await mountItem()
 
     observer.emit({
@@ -216,8 +225,70 @@ describe('timelineForYouItem', () => {
     })
 
     expect(markSeenMock).not.toHaveBeenCalled()
+    expect(recordForYouImpressionMock).not.toHaveBeenCalled()
     expect(dwellEnter).not.toHaveBeenCalled()
     expect(dwellExit).toHaveBeenCalledTimes(1)
+  })
+
+  it('a bare isIntersecting with a tiny ratio and no meaningful viewport share never records an impression', async () => {
+    const { observer } = await mountItem()
+
+    // `isIntersecting` alone, without either the ratio or the viewport-share
+    // branch of `isMeaningfullyVisible` clearing its bar.
+    observer.emit({
+      isIntersecting: true,
+      intersectionRatio: 0.01,
+      intersectionRect: { height: 5 } as DOMRectReadOnly,
+      rootBounds: { height: 800 } as DOMRectReadOnly,
+    })
+
+    expect(recordForYouImpressionMock).not.toHaveBeenCalled()
+  })
+
+  it('records the impression with hasLink/hasMedia read off the status and outOfNetwork off the relevance prop', async () => {
+    const withCardAndMedia = {
+      ...status('post-2'),
+      card: { url: 'https://example.com' },
+      mediaAttachments: [{ id: 'm1', type: 'image' }],
+    } as unknown as mastodon.v1.Status
+
+    const { observer } = await mountItem({ status: withCardAndMedia, relevance: undefined })
+    observer.emit(shortVisibleEntry())
+
+    expect(recordForYouImpressionMock).toHaveBeenCalledTimes(1)
+    expect(recordForYouImpressionMock).toHaveBeenCalledWith(withCardAndMedia, {
+      hasLink: true,
+      hasMedia: true,
+      // No `relevance` prop (out-of-network/no chip): not `'following'`.
+      outOfNetwork: true,
+    })
+  })
+
+  it('treats relevance "following" as in-network, and anything else (or none) as out-of-network', async () => {
+    const inNetwork = await mountItem({ status: status('post-3'), relevance: 'following' })
+    inNetwork.observer.emit(shortVisibleEntry())
+    expect(recordForYouImpressionMock).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ outOfNetwork: false }),
+    )
+    recordForYouImpressionMock.mockClear()
+
+    const trending = await mountItem({ status: status('post-4'), relevance: 'trending' })
+    trending.observer.emit(shortVisibleEntry())
+    expect(recordForYouImpressionMock).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ outOfNetwork: true }),
+    )
+  })
+
+  it('a status with no card and no media reports hasLink/hasMedia false', async () => {
+    const { observer } = await mountItem({ status: status('post-5') })
+    observer.emit(shortVisibleEntry())
+
+    expect(recordForYouImpressionMock).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ hasLink: false, hasMedia: false }),
+    )
   })
 
   it('flushes dwell on unmount', async () => {

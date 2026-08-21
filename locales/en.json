@@ -629,6 +629,8 @@
       "home_feed": "Home feed",
       "label": "Preferences",
       "optimize_for_low_performance_device": "Optimize for low performance device",
+      "personalize_for_you": "Personalize For You to my activity",
+      "personalize_for_you_description": "Fine-tune For You's ranking using how often you favorite, reply, open links and scroll past posts there, instead of the same defaults every viewer starts from.",
       "title": "Experimental Features",
       "unmute_videos": "Video sound on by default",
       "use_star_favorite_icon": "Use star favorite icon",

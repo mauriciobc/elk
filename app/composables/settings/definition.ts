@@ -29,6 +29,13 @@ export interface PreferencesSettings {
   hideBoostsInTimeline: boolean
   disableTimelineAutoloading: boolean
   enableForYouFeed: boolean
+  /**
+   * Personalize the For You ranker to your own measured activity on it,
+   * rather than the fixed defaults every viewer starts from. Governs Tier 1
+   * (measured base rates, `INTERCEPT.md`) now and Tier 2 (`TIER-2.md` §5) if
+   * it ships. Default off.
+   */
+  personalizeForYouRanking: boolean
   grayscaleMode: boolean
   enableAutoplay: boolean
   unmuteVideos: boolean
@@ -93,6 +100,7 @@ export const DEFAULT__PREFERENCES_SETTINGS: PreferencesSettings = {
   hideBoostsInTimeline: false,
   disableTimelineAutoloading: false,
   enableForYouFeed: true,
+  personalizeForYouRanking: false,
   grayscaleMode: false,
   enableAutoplay: false,
   unmuteVideos: false,

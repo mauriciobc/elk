@@ -71,7 +71,9 @@ Between-observer variance is large — boost/fav ranges 0.998 to 5.159 across th
 5 observing instances — because it depends on federation topology.
 
 → `favouriteCoverageRemote` / `reblogCoverageRemote` / `replyCoverageRemote`,
-applied to remote counts only.
+applied to remote counts only — to the engagement composite **and** to the
+`replyDensity` / `reblogDensity` ratios, so a count that federated poorly cannot
+masquerade as a large share of a post's true engagement.
 
 **What this does not do.** It corrects the scale, not the post. Dividing zero by
 0.6 is still zero, and the p10 of 0.00 says a tenth of remote posts have nothing
@@ -164,10 +166,14 @@ means "the viewer rejected this". Predicted-low-engagement should rank a post
 last, not mark it rejected.
 
 Related fix: bot-ness used to *also* inflate `notInterested` (×1.8) and
-`muteAuthor` (×2). That was the same signal counted on both sides at once,
-against the file's own one-signal-one-place rule, and it is what broke the
-negative-band invariant. Those two multipliers are gone; bot-ness now lives on
-the positive heads only, where it is measured.
+`muteAuthor` (×2). That was not double-counting — the engagement prior says
+nothing about how likely a viewer is to mute or block a bot, a quantity no one
+has measured. Those terms were *unvalidated* priors, and it is their removal
+that restores the negative-band invariant: combined with the engagement
+discount, they pushed an ordinary never-dismissed bot post below
+`NEGATIVE_SCORES_OFFSET`, into the band that means "the viewer rejected this".
+Bot-ness now lives on the positive heads only — `botPrior` on the engagement
+heads, and the distinct, non-fading `botFollowPrior` on `followAuthor`.
 
 ---
 
@@ -321,3 +327,15 @@ Stated so the next person can weigh them rather than rediscover them:
   all of them, so it is a biased estimate of the ceiling — a lower bound.
 - **One moment in time.** Re-run `pnpm for-you:calibrate` before trusting any of
   it a year from now.
+- **The priors bite remote posts harder.** The content priors fade with
+  `priorStrength = 1 - popularity`, and popularity is the *corrected* engagement
+  — but remote posts still sit at zero engagement far more often than local
+  ones (59% vs 36%), so the discount priors (bot, link) apply at fuller strength
+  to remote posts and the boost priors (media, hashtags) likewise. Net: content
+  shape is trusted *more* for remote posts, where the counts are *less*
+  reliable. This is a known interaction of the fade, not an intent.
+- **`favouriteCoverageRemote` is the optimistic bound.** It was measured on
+  trending posts, which trended because they propagated well; ordinary posts
+  federate less. So the correction under-corrects the average remote post. It is
+  a conservative default, not a precise one — treat the "same scale as local"
+  equivalence as approximate.

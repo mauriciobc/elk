@@ -1,7 +1,7 @@
 import type { mastodon } from 'masto'
 import type { PreScoringContext } from '../../app/composables/for-you/candidates'
 import type { RankingContext } from '../../app/composables/for-you/ranking'
-import type { ForYouSignals, PostCandidate } from '../../app/composables/for-you/types'
+import type { ForYouCounters, ForYouSignals, PostCandidate } from '../../app/composables/for-you/types'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { createCandidate, POOL_STALE_MS, resetCandidatePool, resetRateLimit, underlyingStatus } from '../../app/composables/for-you/candidates'
 import {
@@ -9,6 +9,7 @@ import {
   AUTO_REFRESH_MAX_INTERVAL_MS,
   AUTO_REFRESH_MIN_INTERVAL_MS,
   autoRefreshIntervalMs,
+  buildRankingContext,
   canAutoRefreshForYou,
   DEFAULT_FOR_YOU_PAGE_SIZE,
   enforceInNetworkFloor,
@@ -16,10 +17,12 @@ import {
   initialAutoRefreshGate,
   MIN_VIABLE_FIRST_PAGE,
   nextAutoRefreshGate,
+  resolveForYouBaseRateReport,
   selectForYouPage,
   shouldAutoRefreshForYou,
   useForYouFeed,
 } from '../../app/composables/for-you/feed'
+import { BASE_RATES, predictActions } from '../../app/composables/for-you/ranking'
 import { EMPTY_SIGNALS } from '../../app/composables/for-you/types'
 
 const NOW = Date.parse('2026-08-16T12:00:00.000Z')
@@ -211,6 +214,119 @@ describe('affinityResolver', () => {
     const { authorPenalty } = affinityResolver(signals({ mutedForYou: ['muted'] }), NOW)!
 
     expect(authorPenalty!('muted')).toBe(1)
+  })
+})
+
+describe('buildRankingContext — measured base rates (INTERCEPT-BUILD.md Steps 5/6)', () => {
+  // Same shape as the "leaves rates within band alone (applied)" fixture in
+  // `tests/unit/for-you-base-rates.test.ts` — every measurable head's k is
+  // set so it shrinks to (roughly) its own shipped value, except
+  // `notInterested`/`muteAuthor`, whose honest zero count pulls the negative
+  // side down without tripping the §6.3 guardrail. That gives a report that
+  // is `applied: true` with a `muteAuthor` visibly below shipped, which is
+  // exactly what a "measured rates reached predictActions" test needs.
+  const realCounters: ForYouCounters = {
+    impressions: 500,
+    eligible: { hasLink: 500, hasMedia: 500, outOfNetwork: 500 },
+    actions: {
+      favourite: 15,
+      reply: 1.75,
+      reblog: 9,
+      quote: 0.3,
+      open: 15,
+      openLink: 6,
+      profileClick: 2.5,
+      photoExpand: 10,
+      videoOpen: 10,
+      notDwelled: 110,
+      follow: 0.3,
+      dismiss: 0,
+      mute: 0,
+    },
+  }
+
+  // `counters` lives on `ForYouSignalsStore`, not `ForYouSignals` — the same
+  // cast `buildRankingContext`/`resolveForYouBaseRateReport` use internally.
+  function signalsWithCounters(counters?: ForYouCounters): ForYouSignals {
+    return { ...signals(), counters } as ForYouSignals
+  }
+
+  const candidate = createCandidate(status('a', { favouritesCount: 40 }), 'federated', false)
+
+  it('preference off: baseRates stays undefined, and scores match the shipped baseline even with real counters sitting there unused', () => {
+    const warm = signalsWithCounters(realCounters)
+    // `undefined` is exactly what `rankedPages` passes as the third argument
+    // when `forYouPersonalizationEnabled()` is false.
+    const ctxOff = buildRankingContext({ now: () => NOW }, warm, undefined)
+    expect(ctxOff.baseRates).toBeUndefined()
+
+    const actual = predictActions(candidate, warm, ctxOff)
+    const shipped = predictActions(candidate, warm, { ...ctxOff, baseRates: BASE_RATES })
+    expect(actual).toEqual(shipped)
+  })
+
+  it('preference on, zero counters: still byte-identical — the exact-cold-start guarantee', () => {
+    const cold = signalsWithCounters(undefined)
+    const report = resolveForYouBaseRateReport(cold)
+    expect(report.applied).toBe(false)
+
+    const ctxOn = buildRankingContext({ now: () => NOW }, cold, report.rates)
+    const ctxOff = buildRankingContext({ now: () => NOW }, cold, undefined)
+
+    expect(predictActions(candidate, cold, ctxOn)).toEqual(predictActions(candidate, cold, ctxOff))
+  })
+
+  it('preference on, real counters: measured rates actually reach predictActions', () => {
+    const warm = signalsWithCounters(realCounters)
+    const report = resolveForYouBaseRateReport(warm)
+    expect(report.applied).toBe(true)
+    expect(report.rates).not.toBe(BASE_RATES)
+    expect(report.rates.muteAuthor).toBeLessThan(BASE_RATES.muteAuthor)
+
+    const ctxOn = buildRankingContext({ now: () => NOW }, warm, report.rates)
+    expect(ctxOn.baseRates).toBe(report.rates)
+
+    const measured = predictActions(candidate, warm, ctxOn)
+    const shipped = predictActions(candidate, warm, { ...ctxOn, baseRates: undefined })
+    expect(measured.muteAuthor).toBeLessThan(shipped.muteAuthor)
+  })
+
+  it('an explicit options.ranking.baseRates wins over the measured one', () => {
+    // `options.ranking` is spread last in `buildRankingContext`, so a caller
+    // that pins rates outranks the viewer's measurement. Worth its own test
+    // rather than inspection: it rests on object spread skipping *absent*
+    // keys instead of clobbering with `undefined`, which is easy to break by
+    // "helpfully" defaulting the Pick's members.
+    const warm = signalsWithCounters(realCounters)
+    const report = resolveForYouBaseRateReport(warm)
+    expect(report.applied).toBe(true)
+
+    const pinned = { ...BASE_RATES, favorite: 0.5 }
+    const ctx = buildRankingContext(
+      { now: () => NOW, ranking: { baseRates: pinned } },
+      warm,
+      report.rates,
+    )
+
+    expect(ctx.baseRates).toBe(pinned)
+    expect(ctx.baseRates).not.toBe(report.rates)
+    expect(predictActions(candidate, warm, ctx).favorite)
+      .toBeGreaterThan(predictActions(candidate, warm, { ...ctx, baseRates: report.rates }).favorite)
+  })
+
+  it('leaves the measured rates in place when options.ranking sets only weights', () => {
+    // The other half of the same guarantee: a partial `options.ranking` must
+    // not wipe `baseRates` just by being spread over it.
+    const warm = signalsWithCounters(realCounters)
+    const report = resolveForYouBaseRateReport(warm)
+
+    const ctx = buildRankingContext(
+      { now: () => NOW, ranking: { weights: { favorite: 1 } } },
+      warm,
+      report.rates,
+    )
+
+    expect(ctx.baseRates).toBe(report.rates)
   })
 })
 

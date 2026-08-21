@@ -203,23 +203,38 @@ function describe(label: string, posts: Post[]) {
  * Reach-controlled, within-instance lift. Both controls matter: engagement
  * varies ~7x across instances and bot share ranges 0-49%, so an effect pooled
  * across instances can be an artifact of which servers were sampled.
+ *
+ * Also reports, per prior, how many of the *testable* instances reproduce the
+ * effect's direction — an effect whose sign flips from server to server is not
+ * real. This is where the "reproduces in N of M instances" figures quoted in
+ * `CALIBRATION.md` come from.
  */
 function lift(posts: Post[], label: string, predicate: (p: Post) => boolean) {
   let weighted = 0
   let n = 0
+  const perInstance: { instance: string, lift: number }[] = []
   for (const instance of new Set(posts.map(p => p.instance))) {
     const group = posts.filter(p => p.instance === instance)
+    let instanceWeighted = 0
+    let instanceN = 0
     for (let bucket = 0; bucket <= 4; bucket++) {
       const inBucket = group.filter(p => Math.min(4, Math.floor(Math.log10(Math.max(p.followers, 1)))) === bucket)
       const yes = inBucket.filter(predicate).map(p => Math.log1p(p.total))
       const no = inBucket.filter(p => !predicate(p)).map(p => Math.log1p(p.total))
       if (yes.length >= 15 && no.length >= 15) {
-        weighted += yes.length * (mean(yes) / Math.max(mean(no), 1e-9))
+        const w = yes.length * (mean(yes) / Math.max(mean(no), 1e-9))
+        weighted += w
         n += yes.length
+        instanceWeighted += w
+        instanceN += yes.length
       }
     }
+    if (instanceN > 0)
+      perInstance.push({ instance, lift: instanceWeighted / instanceN })
   }
-  console.log(`  ${label.padEnd(22)} n=${String(n).padStart(5)}  lift=${n ? f2(weighted / n) : '—'}x`)
+  const pooled = n ? weighted / n : Number.NaN
+  const reproduces = perInstance.filter(p => (pooled < 1 ? p.lift < 1 : p.lift > 1)).length
+  console.log(`  ${label.padEnd(22)} n=${String(n).padStart(5)}  lift=${n ? f2(pooled) : '—'}x  reproduces in ${reproduces} of ${perInstance.length} instances`)
 }
 
 const local: Post[] = []

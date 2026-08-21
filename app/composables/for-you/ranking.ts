@@ -276,6 +276,18 @@ export interface RankingParams {
    * `predictActions`. 1.0 disables one.
    */
   botEngagementPrior: number
+  /**
+   * The bot discount on `followAuthor`, kept separate from
+   * {@link RankingParams.botEngagementPrior} because it must **not** fade as
+   * the post gets popular. The engagement priors fade on the reasoning that
+   * observed counts already embody how much the crowd engaged, so a prior
+   * about engagement is redundant where the evidence is visible. Following an
+   * author is not that quantity: it is a judgment about the account, and a
+   * viral bot post is still a bot you would not follow. Same measured
+   * magnitude, different fade behaviour — hence its own parameter, sweepable
+   * to 1.0 to disable.
+   */
+  botFollowPrior: number
   linkEngagementPrior: number
   mediaEngagementPrior: number
   hashtagEngagementPrior: number
@@ -351,6 +363,7 @@ export const DEFAULT_RANKING_PARAMS: RankingParams = {
   // 1.29x (hashtags), each reproducing within-instance. `botEngagementPrior`
   // sits at the conservative end of its range — see the note at its use site.
   botEngagementPrior: 0.4,
+  botFollowPrior: 0.4,
   linkEngagementPrior: 0.7,
   mediaEngagementPrior: 1.25,
   hashtagEngagementPrior: 1.3,
@@ -455,6 +468,16 @@ export interface RankingContext {
   weights?: Partial<Record<keyof ActionProbabilities, number>>
   /** Parameter overrides, merged over {@link DEFAULT_RANKING_PARAMS}. */
   params?: Partial<RankingParams>
+  /**
+   * Per-head base rate overrides, merged over {@link BASE_RATES}.
+   *
+   * This is how measured rates reach the model: `base-rates.ts` estimates
+   * P(action | shown in For You) from the viewer's own lifetime counters and
+   * shrinks it toward the shipped constant, and `feed.ts` passes the result
+   * through here. Absent (the default, and the cold path) the ranker reads
+   * {@link BASE_RATES} exactly as it always has. See `INTERCEPT.md` §5.
+   */
+  baseRates?: Partial<Record<keyof ActionProbabilities, number>>
 }
 
 function resolveParams(ctx: RankingContext): RankingParams {
@@ -464,6 +487,11 @@ function resolveParams(ctx: RankingContext): RankingParams {
 function resolveWeights(ctx: RankingContext): Record<keyof ActionProbabilities, number> {
   return ctx.weights ? { ...MASTODON_WEIGHTS, ...ctx.weights } : MASTODON_WEIGHTS
 }
+
+// `resolveBaseRates` belongs in this cluster and is deliberately not here:
+// `BASE_RATES` is not declared until the model region below, and
+// `ts/no-use-before-define` rejects the forward reference even though it is
+// runtime-safe. It sits immediately above `predictActions` instead.
 
 // #endregion
 
@@ -477,6 +505,21 @@ function clamp(value: number, min: number, max: number): number {
 
 function clamp01(value: number): number {
   return clamp(value, 0, 1)
+}
+
+/**
+ * Scales one federated count back up by how much of it actually reaches an
+ * observing instance. Local counts are authoritative and never come here.
+ *
+ * The guard is not defensive padding: `scripts/for-you-calibrate.ts` sweeps
+ * these coverages, and `--set favouriteCoverageRemote=0` is a reachable
+ * input. Dividing by it yields `Infinity`, which `logNorm` clamps to
+ * popularity 1.0 for *every* remote post at once — the ranking collapses
+ * silently rather than failing. A non-positive coverage means "no measurement
+ * for this count", so the honest degradation is the raw count.
+ */
+function coverageCorrected(count: number, coverage: number): number {
+  return coverage > 0 ? count / coverage : count
 }
 
 /**
@@ -801,11 +844,10 @@ export function extractRankingFeatures(
   // actually reported, it is what the densities below are shares of, and
   // `impressionProxy` needs the honest number.
   const remote = (account?.acct ?? '').includes('@')
-  const engagementEstimate = remote
-    ? favourites / params.favouriteCoverageRemote
-    + reblogs / params.reblogCoverageRemote
-    + replies / params.replyCoverageRemote
-    : totalEngagement
+  const correctedFavourites = remote ? coverageCorrected(favourites, params.favouriteCoverageRemote) : favourites
+  const correctedReblogs = remote ? coverageCorrected(reblogs, params.reblogCoverageRemote) : reblogs
+  const correctedReplies = remote ? coverageCorrected(replies, params.replyCoverageRemote) : replies
+  const engagementEstimate = correctedFavourites + correctedReblogs + correctedReplies
 
   const popularity = logNorm(engagementEstimate, params.engagementSaturation)
   const velocity = logNorm(
@@ -816,8 +858,17 @@ export function extractRankingFeatures(
   // five-minute-old posts with two favourites; reach alone would hand it to
   // last week's viral post.
   const engagementSignal = 0.5 * popularity + 0.5 * velocity
-  const replyDensity = totalEngagement > 0 ? replies / totalEngagement : 0
-  const reblogDensity = totalEngagement > 0 ? reblogs / totalEngagement : 0
+  // Densities are shares of the *corrected* composite, not of the raw sum.
+  // The three counts federate unequally, so a raw share hands the ratio to
+  // whichever count happened to arrive: with favourites at 0.60 coverage and
+  // replies at 1.00, an ordinary remote post reads as far more reply-heavy
+  // than it is, and `lift(f.replyDensity, 2.5)` then multiplies that artifact
+  // straight into `reply`. The sharpest case is the common one — 96% of
+  // remote posts report zero favourites, so equal observed boosts and replies
+  // read 50/50 when the true post is boost-heavy, boosts having federated at
+  // 0.93 against replies' 1.00. See `CALIBRATION.md`.
+  const replyDensity = engagementEstimate > 0 ? correctedReplies / engagementEstimate : 0
+  const reblogDensity = engagementEstimate > 0 ? correctedReblogs / engagementEstimate : 0
 
   const authorAffinity = account?.id ? affinity.author(account.id) : 0
   const authorPenalty = clamp01(affinity.authorPenalty(account?.id ?? ''))
@@ -968,6 +1019,16 @@ export const BASE_RATES: Record<keyof ActionProbabilities, number> = {
 }
 
 /**
+ * Merges `ctx.baseRates` over {@link BASE_RATES}, the same shape
+ * {@link resolveParams} and {@link resolveWeights} use. Returns the module
+ * constant itself when nothing is overridden, so the cold path allocates
+ * nothing and stays byte-identical to the pre-measurement ranker.
+ */
+function resolveBaseRates(ctx: RankingContext): Record<keyof ActionProbabilities, number> {
+  return ctx.baseRates ? { ...BASE_RATES, ...ctx.baseRates } : BASE_RATES
+}
+
+/**
  * The Phoenix substitute. Each head is `base rate x independent multiplicative
  * lifts`, which is a log-linear model with hand-set coefficients — the same
  * functional family a logistic regression would land in, minus the training.
@@ -992,7 +1053,7 @@ export function predictActions(
 ): ActionProbabilities {
   const f = extractRankingFeatures(candidate, signals, ctx)
   const params = resolveParams(ctx)
-  const B = BASE_RATES
+  const B = resolveBaseRates(ctx)
 
   // ── measured content priors ─────────────────────────────────────────────
   // Multiplicative effects measured off the live fediverse, applied to the
@@ -1208,7 +1269,9 @@ export function predictActions(
         * lift(f.tagAffinity, 2, 0.6)
         * lift(f.authorReach, 1.5)
         * (f.verified ? 1.5 : 1)
-        * (f.bot ? 0.4 : 1)
+        // Not `botPrior`: that one fades with popularity, and this one must
+        // not. See {@link RankingParams.botFollowPrior}.
+        * (f.bot ? params.botFollowPrior : 1)
         * (f.isReply ? 0.7 : 1),
       )
 

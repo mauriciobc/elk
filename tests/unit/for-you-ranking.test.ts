@@ -488,6 +488,32 @@ describe('measured content priors', () => {
   })
 })
 
+describe('botFollowPrior — the author-level bot discount on followAuthor', () => {
+  const follow = (o: Parameters<typeof makeCandidate>[0]) =>
+    predictActions(makeCandidate({ inNetwork: false, ...o }), signals(), ctx()).followAuthor
+
+  it('discounts a bot author independent of post popularity', () => {
+    // Following a bot is an author-level judgment, not a crowd-engagement
+    // effect, so unlike the engagement priors this discount must NOT fade as
+    // the post gets popular: a viral bot post is still a bot you would not
+    // follow. The gap is the same at zero and at high engagement.
+    const gap = (favourites: number) =>
+      follow({ bot: false, favourites }) / follow({ bot: true, favourites })
+
+    expect(gap(0)).toBeCloseTo(1 / DEFAULT_RANKING_PARAMS.botFollowPrior, 10)
+    expect(gap(5_000)).toBeCloseTo(1 / DEFAULT_RANKING_PARAMS.botFollowPrior, 10)
+  })
+
+  it('is sweepable: botFollowPrior 1 equalizes bot and human followAuthor', () => {
+    expect(follow({ bot: true })).toBeLessThan(follow({ bot: false }))
+
+    const neutral = ctx({ params: { botFollowPrior: 1 } })
+    const human = predictActions(makeCandidate({ inNetwork: false, bot: false }), signals(), neutral).followAuthor
+    const bot = predictActions(makeCandidate({ inNetwork: false, bot: true }), signals(), neutral).followAuthor
+    expect(bot).toBeCloseTo(human, 12)
+  })
+})
+
 describe('scoreCandidate — the weighted sum', () => {
   it('is exactly the sum of one head when the other weights are zeroed', () => {
     const context = ctx({ weights: onlyWeights({ favorite: 1 }) })
@@ -686,7 +712,7 @@ describe('engagement keeps discriminating across the whole corpus', () => {
     expect(estimate({ acct: 'a', favourites: 20 })).toBeCloseTo(20, 10)
 
     // And the raw observed sum stays honest either way — `impressionProxy`
-    // and the density ratios below depend on it being what was reported.
+    // depends on it being what was reported.
     expect(extractRankingFeatures(
       makeCandidate({ acct: 'a@remote.example', favourites: 20 }),
       signals(),
@@ -702,6 +728,53 @@ describe('engagement keeps discriminating across the whole corpus', () => {
     const remoteSilent = raw(makeCandidate({ acct: 'bob@remote.example', favourites: 0 }))
     const localSilent = raw(makeCandidate({ acct: 'bob', favourites: 0 }))
     expect(remoteSilent).toBeCloseTo(localSilent, 12)
+  })
+
+  it('corrects the density ratios of a remote post by per-count coverage', () => {
+    // The three counts federate unequally, so a raw share lets whichever count
+    // arrived dominate. Favourites arrive at 0.60, boosts at 0.93, replies at
+    // 1.00 — so raw shares overstate how reply- and boost-heavy a remote post
+    // really is, and the density lifts must be computed from the *corrected*
+    // counts, not from the raw sum.
+    const features = extractRankingFeatures(
+      makeCandidate({ acct: 'a@remote.example', favourites: 30, reblogs: 20, replies: 10 }),
+      signals(),
+      ctx(),
+    )
+    const estimate = 30 / 0.6 + 20 / 0.93 + 10
+    expect(features.replyDensity).toBeCloseTo(10 / estimate, 10)
+    expect(features.reblogDensity).toBeCloseTo((20 / 0.93) / estimate, 10)
+    // The raw shares would read 10/60 and 20/60 — both overstate the density.
+    expect(features.replyDensity).toBeLessThan(10 / 60)
+    expect(features.reblogDensity).toBeLessThan(20 / 60)
+  })
+
+  it('does not read a remote post whose favourites never arrived as more reply-heavy than it is', () => {
+    // 96% of remote posts report zero favourites. With fav=0 and equal raw
+    // boosts and replies, the raw shares are 50/50 — but boosts federate at
+    // 0.93 while replies arrive complete, so the true post is more boost-heavy
+    // than reply-heavy. The corrected ratios must reflect that.
+    const features = extractRankingFeatures(
+      makeCandidate({ acct: 'a@remote.example', reblogs: 20, replies: 20 }),
+      signals(),
+      ctx(),
+    )
+    expect(features.reblogDensity).toBeGreaterThan(features.replyDensity)
+    expect(features.replyDensity).toBeCloseTo(20 / (20 / 0.93 + 20), 10)
+  })
+
+  it('treats a non-positive coverage override as "no correction" rather than dividing by zero', () => {
+    // The replay harness allows `--set favouriteCoverageRemote=0`. Without a
+    // guard that produces Infinity and clamps every remote post to popularity
+    // 1.0, silently collapsing the ranking. A non-positive coverage must
+    // degrade to using the raw count instead.
+    const features = extractRankingFeatures(
+      makeCandidate({ acct: 'a@remote.example', favourites: 20, reblogs: 10, replies: 5 }),
+      signals(),
+      ctx({ params: { favouriteCoverageRemote: 0 } }),
+    )
+    expect(Number.isFinite(features.engagementEstimate)).toBe(true)
+    expect(features.engagementEstimate).toBe(20 + 10 / 0.93 + 5)
   })
 })
 

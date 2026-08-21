@@ -1,6 +1,6 @@
 import type { mastodon } from 'masto'
 import type { Ref } from 'vue'
-import type { ForYouSignals } from './types'
+import type { ForYouCounterAction, ForYouCounters, ForYouSignals } from './types'
 
 /**
  * The viewer model for the "For You" feed.
@@ -39,7 +39,7 @@ import type { ForYouSignals } from './types'
 export const STORAGE_KEY_FOR_YOU_SIGNALS = 'elk-for-you-signals'
 
 /** Bumped when the persisted shape changes; see {@link normalizeSignals}. */
-export const SIGNALS_VERSION = 2
+export const SIGNALS_VERSION = 3
 
 /**
  * The engagements we can observe from the client.
@@ -117,6 +117,27 @@ export interface ForYouSignalsStore extends ForYouSignals {
   dismissed: EngagementSignal[]
   /** Derived, like the affinity maps: accountId -> weight for *boosters*. */
   boosterAffinity: Record<string, number>
+  /**
+   * Lifetime observation counts for measured base rates (`INTERCEPT.md` §3).
+   *
+   * Raw observations, not derived state: unlike the affinity maps above,
+   * these are never decayed, never evicted, and must survive a
+   * `SIGNALS_VERSION` bump — see the `stale` handling in
+   * {@link normalizeSignals}. `|engaged[kind]| / |seen|` looks like the
+   * estimator and is not one, because both sides are capped
+   * (`MAX_SIGNALS_PER_KIND` over `MAX_SEEN`) and the numerator is also
+   * decayed; these counters exist to be the honest ratio instead.
+   */
+  counters: ForYouCounters
+  /**
+   * Ids For You actually put on screen — the population `counters` measures
+   * against. Bounded and evicted like `seen` (same {@link MAX_SEEN}), but a
+   * genuinely separate array: `seen` is also written from
+   * `masto/routes.ts`'s status-detail navigation, which is not a For You
+   * impression and must never be mistaken for one (the "population trap",
+   * `INTERCEPT.md` §3). Written only from {@link recordForYouImpression}.
+   */
+  impressed: string[]
 }
 
 /**
@@ -368,7 +389,57 @@ export function createEmptySignals(): ForYouSignalsStore {
     notInterested: [],
     mutedForYou: [],
     lastDecay: 0,
+    counters: {
+      impressions: 0,
+      eligible: { hasLink: 0, hasMedia: 0, outOfNetwork: 0 },
+      actions: {},
+    },
+    impressed: [],
   }
+}
+
+/** Every key {@link ForYouCounters.actions} can be indexed by. */
+const COUNTER_ACTION_KEYS: ForYouCounterAction[] = [...ENGAGEMENT_KINDS, 'dismiss', 'mute']
+
+function nonNegativeNumber(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 0
+}
+
+/** Repairs a persisted `counters` blob the same way the rest of the store is repaired. */
+function normalizeCounters(value: unknown): ForYouCounters {
+  const raw = isRecord(value) ? value : {}
+  const rawEligible = isRecord(raw.eligible) ? raw.eligible : {}
+  const rawActions = isRecord(raw.actions) ? raw.actions : {}
+
+  const actions: Partial<Record<ForYouCounterAction, number>> = {}
+  for (const key of COUNTER_ACTION_KEYS) {
+    const n = nonNegativeNumber(rawActions[key])
+    if (n > 0)
+      actions[key] = n
+  }
+
+  return {
+    impressions: nonNegativeNumber(raw.impressions),
+    eligible: {
+      hasLink: nonNegativeNumber(rawEligible.hasLink),
+      hasMedia: nonNegativeNumber(rawEligible.hasMedia),
+      outOfNetwork: nonNegativeNumber(rawEligible.outOfNetwork),
+    },
+    actions,
+  }
+}
+
+/**
+ * Adjusts one action counter, floored at 0 so a retraction can never drive it
+ * negative. Deletes the key at zero rather than storing it, matching how
+ * `engaged[kind]` only appears on the store when it is non-empty.
+ */
+function bumpActionCounter(signals: ForYouSignalsStore, action: ForYouCounterAction, delta: number) {
+  const next = Math.max(0, (signals.counters.actions[action] ?? 0) + delta)
+  if (next > 0)
+    signals.counters.actions[action] = next
+  else
+    delete signals.counters.actions[action]
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -499,6 +570,11 @@ export function normalizeSignals(raw: unknown): { signals: ForYouSignalsStore, c
     notInterested: normalizeStringList(raw.notInterested, MAX_NOT_INTERESTED),
     mutedForYou: normalizeStringList(raw.mutedForYou, MAX_MUTED),
     lastDecay: typeof raw.lastDecay === 'number' && Number.isFinite(raw.lastDecay) ? raw.lastDecay : 0,
+    // Raw observations, not derived: kept regardless of `stale`, unlike the
+    // affinity maps above — a `SIGNALS_VERSION` bump must not silently reset
+    // the calibration data (`INTERCEPT.md` §3, "Version discipline").
+    counters: normalizeCounters(raw.counters),
+    impressed: normalizeStringList(raw.impressed, MAX_SEEN),
   }
 
   return { signals, changed: !deepEqual(raw, signals) }
@@ -581,6 +657,18 @@ export function recordSignal(
 
   const list = signals.engaged[kind] ?? []
   signals.engaged[kind] = sortDedupTruncate([signal, ...list], maxSignalsFor(kind))
+
+  // Gated on `impressed`: `recordEngagement` is wired globally
+  // (`masto/status.ts:88`) and fires for a favourite/boost/reply anywhere in
+  // the app, not just this feed. Counting all of it over a For You-only
+  // denominator would overstate every rate with a *correlated* bias — a post
+  // the viewer deliberately navigated to has a far higher action rate than
+  // one that merely scrolled past (`INTERCEPT.md` §3). The gate only touches
+  // the counter: the signal above is recorded exactly as it always was, so
+  // affinity behaviour is unchanged either way.
+  if (signal.statusId && signals.impressed.includes(signal.statusId))
+    bumpActionCounter(signals, kind, 1)
+
   return deriveAffinities(signals, now)
 }
 
@@ -598,6 +686,14 @@ export function forgetSignal(
   if (next.length === list.length)
     return signals
   signals.engaged[kind] = next
+
+  // Symmetric with the increment above: an un-favourite of a post that was
+  // never impressed never bumped the counter, so it must not decrement it
+  // either — otherwise the floor-at-0 clamp would eat a *different* action's
+  // headroom instead of doing nothing, the moment counts happen to cross.
+  if (signals.impressed.includes(statusId))
+    bumpActionCounter(signals, kind, -1)
+
   return deriveAffinities(signals, now)
 }
 
@@ -621,6 +717,10 @@ export function applyNotInterestedToSignals(
     if (list?.some(entry => entry.statusId === statusId))
       signals.engaged[kind] = list.filter(entry => entry.statusId !== statusId)
   }
+
+  // Same population gate as every other action counter.
+  if (signals.impressed.includes(statusId))
+    bumpActionCounter(signals, 'dismiss', 1)
 
   return deriveAffinities(signals, now)
 }
@@ -653,22 +753,47 @@ export function forgetNotInterestedToSignals(
 
   const before = signals.dismissed.length
   signals.dismissed = signals.dismissed.filter(signal => signal.statusId !== statusId)
+  const dismissalRemoved = signals.dismissed.length !== before
 
-  if (at === -1 && signals.dismissed.length === before)
+  if (at === -1 && !dismissalRemoved)
     return signals
+
+  // Mirrors the increment in `applyNotInterestedToSignals`: only decrement
+  // when a dismissal actually existed to undo, floored at 0 by
+  // `bumpActionCounter`.
+  if (dismissalRemoved && signals.impressed.includes(statusId))
+    bumpActionCounter(signals, 'dismiss', -1)
+
   return deriveAffinities(signals, now)
 }
 
-/** Mutes an author for this feed only. Mutates and returns `signals`. */
+/**
+ * Mutes an author for this feed only. Mutates and returns `signals`.
+ *
+ * `muteAuthor` has no post of its own to gate a counter on — it takes an
+ * `accountId` — and this same function is reachable from three surfaces:
+ * `TimelineForYouItem.vue`'s "show less from author" (a genuine For You
+ * action) and `relationship.ts`'s account-wide mute/block (reachable from
+ * anywhere, nothing to do with this feed). `INTERCEPT-BUILD.md`'s
+ * "Attribution gaps to accept, not solve" calls for counting only the For
+ * You call site rather than engineering a real fix, so `statusId` is
+ * optional and *only* the For You call site passes one: gating on its
+ * `impressed` membership, the same population check every other action
+ * counter uses, makes the two account-wide call sites (which pass none)
+ * naturally never count.
+ */
 export function applyMuteToSignals(
   signals: ForYouSignalsStore,
   accountId: string,
   now: number = Date.now(),
+  statusId?: string,
 ): ForYouSignalsStore {
   if (!accountId)
     return signals
   if (!signals.mutedForYou.includes(accountId))
     pushCapped(signals.mutedForYou, accountId, MAX_MUTED)
+  if (statusId && signals.impressed.includes(statusId))
+    bumpActionCounter(signals, 'mute', 1)
   return deriveAffinities(signals, now)
 }
 
@@ -867,6 +992,96 @@ export function markSeenInSignals(
   return signals
 }
 
+/**
+ * Eligibility flags for an impression's conditionally-gated heads
+ * (`openLink`/`photoExpand`+`videoOpen`/`followAuthor`), computed once at the
+ * impression call site.
+ *
+ * `hasLink`/`hasMedia` are structural — derivable from the status alone, the
+ * same way `ranking.ts`'s `extractRankingFeatures` reads them. `outOfNetwork`
+ * is not: it needs relationship context a bare `mastodon.v1.Status` does not
+ * carry (`PostCandidate.inNetwork` lives on the *candidate*, one layer up),
+ * so it has to be supplied by whoever has that context — `TimelineForYouItem
+ * .vue` reads it off its own `relevance` prop, since `relevance === 'following'`
+ * iff the candidate's `inNetwork` was true for this exact status (see
+ * `forYouRelevanceReason` in `feed.ts`).
+ */
+export interface ForYouImpressionFlags {
+  hasLink: boolean
+  hasMedia: boolean
+  outOfNetwork: boolean
+}
+
+/**
+ * What {@link recordForYouImpressionInSignals} accepts: a full status — from
+ * which it derives `hasLink`/`hasMedia` itself, and treats as in-network
+ * (undercounting `eligible.outOfNetwork` is the safer failure than guessing
+ * from nothing) — or a caller-computed id-plus-flags object, for a caller
+ * that has more context than a bare status carries.
+ */
+type ForYouImpressionInput = mastodon.v1.Status | ({ id: string } & ForYouImpressionFlags)
+
+function isImpressionFlags(input: ForYouImpressionInput): input is { id: string } & ForYouImpressionFlags {
+  return 'hasLink' in input && 'hasMedia' in input && 'outOfNetwork' in input
+}
+
+function resolveImpressionFlags(input: ForYouImpressionInput): { id: string } & ForYouImpressionFlags {
+  if (isImpressionFlags(input))
+    return input
+  const content = input.reblog ?? input
+  return {
+    id: input.reblog?.id ?? input.id,
+    hasLink: !!content.card,
+    hasMedia: (content.mediaAttachments?.length ?? 0) > 0,
+    outOfNetwork: false,
+  }
+}
+
+/**
+ * Records a genuine For You impression: appends to `impressed` (deduped,
+ * evicted oldest-first at {@link MAX_SEEN}, mirroring
+ * {@link markSeenInSignals} above) and increments `counters.impressions` plus
+ * whichever `eligible` counters this impression qualifies for.
+ *
+ * Only increments anything when the id was *not* already in `impressed` — a
+ * re-impression of the same post (rapid scroll re-triggering the observer,
+ * or the same post resurfacing on a later page) must not double-count,
+ * exactly as {@link markSeenInSignals} dedupes. `index`, like there, lets the
+ * hot path (one call per post that scrolls into view) avoid rebuilding a
+ * few-thousand-entry `Set` on every call.
+ */
+export function recordForYouImpressionInSignals(
+  signals: ForYouSignalsStore,
+  input: ForYouImpressionInput,
+  index?: Set<string>,
+): ForYouSignalsStore {
+  const flags = resolveImpressionFlags(input)
+  if (!flags.id)
+    return signals
+
+  const set = index ?? new Set(signals.impressed)
+  if (set.has(flags.id))
+    return signals
+
+  set.add(flags.id)
+  signals.impressed.push(flags.id)
+  if (signals.impressed.length > MAX_SEEN) {
+    const evicted = signals.impressed.splice(0, signals.impressed.length - MAX_SEEN)
+    for (const id of evicted)
+      set.delete(id)
+  }
+
+  signals.counters.impressions++
+  if (flags.hasLink)
+    signals.counters.eligible.hasLink++
+  if (flags.hasMedia)
+    signals.counters.eligible.hasMedia++
+  if (flags.outOfNetwork)
+    signals.counters.eligible.outOfNetwork++
+
+  return signals
+}
+
 /** Highest-affinity keys, strongest first, ignoring anything non-positive. */
 export function topAffinityKeys(
   record: Record<string, number> | undefined,
@@ -969,6 +1184,7 @@ export function useForYouSignals(): Ref<ForYouSignalsStore> {
   // with no setter, so this has to be an in-place merge either way.
   Object.assign(store, normalizeSignals(store).signals)
   invalidateSeenIndex()
+  invalidateImpressedIndex()
   deriveAffinities(store)
 
   return signals
@@ -1266,6 +1482,43 @@ export function isSeen(id: string): boolean {
   return getSeenSet(useForYouSignals().value).has(id)
 }
 
+// Same idiom as `seenIndex` above, for `impressed`: this runs once per post
+// that scrolls into view, so it must not rebuild a few-thousand-entry `Set`
+// per call.
+let impressedIndex: { key: string, source: string[], set: Set<string> } | undefined
+
+function invalidateImpressedIndex() {
+  impressedIndex = undefined
+}
+
+function getImpressedSet(signals: ForYouSignalsStore) {
+  const key = signalsOwnerKey()
+  if (!impressedIndex || impressedIndex.key !== key || impressedIndex.source !== signals.impressed)
+    impressedIndex = { key, source: signals.impressed, set: new Set(signals.impressed) }
+  return impressedIndex.set
+}
+
+/**
+ * Records a genuine For You impression — `TimelineForYouItem.vue`'s latched
+ * `isMeaningfullyVisible` observer, and *only* that: `masto/routes.ts:98`'s
+ * `markSeen` call (a status-detail navigation, from anywhere) must never
+ * reach this, or the numerator/denominator population match the whole
+ * measurement depends on breaks (`INTERCEPT.md` §3, "the population trap").
+ *
+ * `flags` is supplied by the caller because `outOfNetwork` needs relationship
+ * context a bare status does not carry — see {@link ForYouImpressionFlags}.
+ */
+export function recordForYouImpression(status: mastodon.v1.Status | undefined, flags: ForYouImpressionFlags) {
+  if (!import.meta.client || !status)
+    return
+  const signals = useForYouSignals().value
+  recordForYouImpressionInSignals(
+    signals,
+    { id: status.reblog?.id ?? status.id, ...flags },
+    getImpressedSet(signals),
+  )
+}
+
 /** Explicit dismissal of a single post. */
 export function markNotInterested(status: mastodon.v1.Status | undefined) {
   if (!import.meta.client || !status)
@@ -1290,11 +1543,18 @@ export function forgetNotInterested(statusId: string) {
   forgetNotInterestedToSignals(useForYouSignals().value, statusId)
 }
 
-/** Hides an author from this feed only, without muting them account-wide. */
-export function muteAuthorForYou(accountId: string) {
+/**
+ * Hides an author from this feed only, without muting them account-wide.
+ *
+ * `statusId`, when given, gates the `mute` counter's population match — see
+ * {@link applyMuteToSignals}'s docblock for why this function has two other
+ * call sites (`relationship.ts`'s account-wide mute/block) that must never
+ * pass one.
+ */
+export function muteAuthorForYou(accountId: string, statusId?: string) {
   if (!import.meta.client || !accountId)
     return
-  applyMuteToSignals(useForYouSignals().value, accountId)
+  applyMuteToSignals(useForYouSignals().value, accountId, undefined, statusId)
 }
 
 /**
